@@ -1,0 +1,15 @@
+Name: Cloudburst Reverb
+Brand: Atmos Labs
+
+Category: Reverb
+
+Notes:
+Big ambient reverb, stereo out. Expression input for mix or decay.
+No MIDI. Sounds huge but wants more current than most analog pedals.
+
+Power / I-O:
+Power: 9V DC center-negative
+Current draw: 250mA
+I/O: mono in, stereo out
+Expression: yes
+Size: 120mm W x 62mm D

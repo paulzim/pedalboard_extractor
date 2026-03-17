@@ -1,0 +1,13 @@
+Name: SpringRoom Verb
+Brand: Tidepool Audio
+
+Category: Reverb
+
+Notes:
+Spring-style reverb with drip. Mono only. No expression, no MIDI.
+
+Specs:
+Power: 9VDC center-negative
+Current: 65mA
+I/O: mono in, mono out
+Size: 112mm W x 60mm D

@@ -1,0 +1,14 @@
+Name: SplitLift Utility
+Brand: GroundSafe
+
+Category: Utility
+
+Notes:
+A simple active splitter + transformer isolate on one output (ground lift).
+No MIDI. Mono in, dual mono outs.
+
+Specs:
+Power: 9V DC center-negative
+Current draw: 90mA
+I/O: mono in, mono out (A) + mono out (B)
+Size: 125mm W x 60mm D

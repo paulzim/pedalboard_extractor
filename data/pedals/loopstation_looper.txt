@@ -1,0 +1,15 @@
+Name: LoopStation Mini
+Brand: RepeatCo
+
+Category: Looper
+
+Notes:
+Compact looper with stereo out. MIDI clock support over USB.
+No expression. Footswitch can be set for stop/undo.
+
+Specs:
+Power: 9VDC center-negative
+Current draw: 140mA
+I/O: mono in, stereo out
+MIDI: yes (USB)
+Size: 110mm W x 60mm D

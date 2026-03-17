@@ -1,0 +1,14 @@
+Name: Aurora Delay
+Brand: NightSky Audio
+
+Category: Delay
+
+Notes:
+A clean digital delay with simple controls. Stereo out, mono in.
+Tap tempo on the footswitch. No MIDI.
+
+Specs-ish:
+Power: 9V DC, center-negative
+Current draw: 75mA
+I/O: mono in, stereo out
+Size: 118mm W x 60mm D

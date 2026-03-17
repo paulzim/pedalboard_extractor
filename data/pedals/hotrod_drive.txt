@@ -1,0 +1,14 @@
+Name: HotRod Distortion
+Brand: Redline
+
+Category: Drive
+
+Notes:
+Higher-gain distortion. Runs at 9V, but can also accept 18V for extra headroom.
+No MIDI. Mono.
+
+Specs:
+Power: 9V (accepts 18V)
+Current draw: 35mA
+I/O: mono in, mono out
+Size: 120mm W x 65mm D

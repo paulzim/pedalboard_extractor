@@ -1,0 +1,15 @@
+Name: Canyon Tape Echo
+Brand: Copperline
+
+Category: Delay
+
+Notes:
+Tape-ish delay with presets and deeper control. MIDI supported via TRS.
+Stereo I/O. Tap tempo supported.
+
+Specs:
+9VDC (center-negative)
+Current: 180 mA
+MIDI: yes (TRS)
+I/O: stereo in / stereo out
+Dimensions: 4.9in x 2.5in

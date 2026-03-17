@@ -1,0 +1,13 @@
+Name: Metron Tuner
+Brand: PulseWorks
+
+Category: Tuner
+
+Notes:
+Pedal tuner with buffer option. Mono in/out. No MIDI.
+
+Specs:
+Power: 9V DC center-negative
+Current: 30mA
+I/O: mono in, mono out
+Dimensions: 98mm x 50mm

@@ -1,0 +1,16 @@
+Name: Nexus Multi-FX
+Brand: Prism Audio Tools
+
+Category: Multi FX
+
+Notes:
+Multi-effects unit. Stereo I/O. MIDI supported (TRS) for program changes and clock (TRS Type B).
+Expression input supported. Top-mounted jacks. High current draw: plan isolated power.
+
+Specs:
+Power: 9V DC center-negative
+Current draw: 500mA
+I/O: stereo in, stereo out
+MIDI: yes (TRS) Type B
+Expression: yes
+Dimensions: 7.0in x 4.2in
