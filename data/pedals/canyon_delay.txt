@@ -4,12 +4,12 @@ Brand: Copperline
 Category: Delay
 
 Notes:
-Tape-ish delay with presets and deeper control. MIDI supported via TRS.
-Stereo I/O. Tap tempo supported.
+Tape-ish delay with presets and deeper control. MIDI supported via TRS (Type A).
+Stereo I/O. Tap tempo supported. Top-mounted jacks.
 
 Specs:
 9VDC (center-negative)
 Current: 180 mA
-MIDI: yes (TRS)
+MIDI: yes (TRS) Type A
 I/O: stereo in / stereo out
 Dimensions: 4.9in x 2.5in

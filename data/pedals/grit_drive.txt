@@ -4,7 +4,7 @@ Brand: Stonewave
 Category: Drive
 
 Notes:
-Classic overdrive flavor. No stereo, no MIDI, no tap. Simple.
+Classic overdrive flavor. True bypass. Side jacks. Simple, mono only.
 
 Specs:
 9V DC center-negative
@@ -12,3 +12,4 @@ Current draw: 20mA
 I/O: mono in, mono out
 Width: 115 mm
 Depth: 60 mm
+True bypass
