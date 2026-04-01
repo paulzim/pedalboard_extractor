@@ -3,7 +3,12 @@ from __future__ import annotations
 import streamlit as st
 from typing import List, Dict
 
-from src.query_demo import load_records, parse_question, apply_constraints
+from src.query_demo import (
+    load_records,
+    parse_question,
+    apply_constraints,
+    evaluate_constraints,  # <-- new import for explain mode
+)
 from src.schema import PedalRecord
 from src.llm_answer import ollama_narrate
 
@@ -94,7 +99,9 @@ def build_structured_context(
             pedal_lines.append(f"   Control: {', '.join(control_bits)}")
 
         if r.size_mm.width is not None and r.size_mm.depth is not None:
-            pedal_lines.append(f"   Size: {r.size_mm.width:.0f}mm x {r.size_mm.depth:.0f}mm")
+            pedal_lines.append(
+                f"   Size: {r.size_mm.width:.0f}mm x {r.size_mm.depth:.0f}mm"
+            )
 
         lines.extend(pedal_lines)
 
@@ -154,11 +161,40 @@ def ollama_controls(scope_key: str) -> Dict[str, object]:
       use_llm (bool), model (str), base_url (str)
     """
     with st.expander("LLM narration (Ollama)", expanded=False):
-        use_llm = st.checkbox("Use Ollama to narrate", value=False, key=f"{scope_key}_use_ollama")
-        model = st.text_input("Ollama model", value="llama3.2:3b", key=f"{scope_key}_ollama_model")
-        base_url = st.text_input("Ollama base URL", value="http://127.0.0.1:11434", key=f"{scope_key}_ollama_url")
-        st.caption("Tip: `ollama pull llama3.2:3b` (or `llama3.1:8b`). Filtering stays deterministic; Ollama just narrates.")
+        use_llm = st.checkbox(
+            "Use Ollama to narrate", value=False, key=f"{scope_key}_use_ollama"
+        )
+        model = st.text_input(
+            "Ollama model", value="llama3.2:3b", key=f"{scope_key}_ollama_model"
+        )
+        base_url = st.text_input(
+            "Ollama base URL", value="http://127.0.0.1:11434", key=f"{scope_key}_ollama_url"
+        )
+        st.caption(
+            "Tip: `ollama pull llama3.2:3b` (or `llama3.1:8b`). Filtering stays deterministic; Ollama just narrates."
+        )
     return {"use_llm": use_llm, "model": model, "base_url": base_url}
+
+
+def build_elimination_rows(records: List[PedalRecord], constraints: dict) -> List[Dict]:
+    """
+    Returns rows for a dataframe of eliminated pedals.
+    """
+    rows: List[Dict] = []
+    for r in records:
+        ev = evaluate_constraints(r, constraints)
+        if ev.passed:
+            continue
+        rows.append(
+            {
+                "id": r.id,
+                "name": r.name,
+                "category": r.category,
+                "first_failure": ev.first_failure or "",
+                "all_failures": "; ".join(ev.failures),
+            }
+        )
+    return rows
 
 
 st.title("Pedalboard Extractor Demo")
@@ -182,19 +218,46 @@ with tabs[0]:
         key="question_mode_input",
     )
 
+    # Explain toggle (NEW)
+    explain = st.checkbox("Explain eliminations", value=False, key="question_mode_explain")
+
     llm_cfg = ollama_controls("question_mode")
 
     if q:
         c = parse_question(q)
         results = apply_constraints(records, c)
+
         st.caption(f"Parsed constraints: {c}")
+
+        # Explain section (NEW)
+        if explain:
+            eliminated_rows = build_elimination_rows(records, c)
+            eliminated_count = len(eliminated_rows)
+            matched_count = len(results)
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Matched", matched_count)
+            with col_b:
+                st.metric("Eliminated", eliminated_count)
+            with col_c:
+                st.metric("Total", len(records))
+
+            if eliminated_rows:
+                st.markdown("### Why pedals were eliminated")
+                st.dataframe(eliminated_rows, use_container_width=True)
+            else:
+                st.info("Nothing was eliminated — all records matched the constraints (rare but possible).")
+
         st.write(f"Matches: {len(results)}")
 
         if results:
             st.dataframe([record_row(r) for r in results], use_container_width=True)
 
             st.markdown("### Inspect sources")
-            pick = st.selectbox("Pick a result", options=[r.id for r in results], key="question_mode_pick")
+            pick = st.selectbox(
+                "Pick a result", options=[r.id for r in results], key="question_mode_pick"
+            )
             rr = next(r for r in results if r.id == pick)
             show_sources(rr)
         else:
@@ -340,13 +403,16 @@ with tabs[2]:
         st.markdown("### LLM narration (from selected pedals)")
         with st.spinner("Asking Ollama..."):
             try:
-                # We treat the selected pedals as the "matches" list.
                 question_for_llm = (
                     "Given these pedals and the user's preferences/constraints, recommend a coherent signal chain "
                     "and explain the reasoning. Stick to known facts; don't invent specs."
                 )
                 ans = ollama_narrate(
-                    question=question_for_llm + "\n\nPreferences: " + preferences + "\nConstraints: " + constraints,
+                    question=question_for_llm
+                    + "\n\nPreferences: "
+                    + preferences
+                    + "\nConstraints: "
+                    + constraints,
                     matches=selected_pc,
                     model=str(llm_cfg_pc["model"]),
                     base_url=str(llm_cfg_pc["base_url"]),
