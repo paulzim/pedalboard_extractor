@@ -1,32 +1,51 @@
 from __future__ import annotations
 
-import streamlit as st
-from typing import List, Dict, Tuple, Optional
+import re
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import streamlit as st
 from sentence_transformers import SentenceTransformer
 
-from src.query_demo import (
-    load_records,
-    parse_question,
-    apply_constraints,
-    evaluate_constraints,
-)
-from src.schema import PedalRecord
 from src.llm_answer import ollama_narrate
+from src.query_demo import apply_constraints, evaluate_constraints, load_records, parse_question
+from src.schema import PedalRecord
 
 st.set_page_config(page_title="Pedalboard Extractor Demo", layout="wide")
 
 
 # ---------------------------
-# Records + display helpers
+# Caching / loading
 # ---------------------------
 
 @st.cache_data
 def cached_records(path: str) -> List[PedalRecord]:
     return load_records(path)
 
+
+@st.cache_data
+def load_embeddings(index_path: str) -> Tuple[List[str], np.ndarray]:
+    p = Path(index_path)
+    data = np.load(p, allow_pickle=False)
+    ids = data["ids"].tolist()
+    embs = data["embs"]  # normalized float32 [N, D]
+    return ids, embs
+
+
+@st.cache_resource
+def load_embed_model(model_name: str) -> SentenceTransformer:
+    return SentenceTransformer(model_name)
+
+
+def normalize_vec(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v) + 1e-12
+    return v / n
+
+
+# ---------------------------
+# Display helpers
+# ---------------------------
 
 def record_row(r: PedalRecord) -> Dict:
     return {
@@ -37,6 +56,7 @@ def record_row(r: PedalRecord) -> Dict:
         "current_ma": r.power.current_ma,
         "polarity": r.power.polarity,
         "stereo_out": r.io.stereo_out,
+        "stereo_in": r.io.stereo_in,
         "midi": r.control.midi,
         "midi_type": r.control.midi_type,
         "trs_midi_type": r.control.trs_midi_type,
@@ -77,12 +97,10 @@ def build_elimination_rows(records: List[PedalRecord], constraints: dict) -> Lis
 
 
 # ---------------------------
-# Prompt comparison helpers
+# Context builders (raw vs structured)
 # ---------------------------
 
-def build_structured_context(
-    selected: List[PedalRecord], preferences: str = "", constraints: str = ""
-) -> str:
+def build_structured_context(selected: List[PedalRecord], preferences: str = "", constraints: str = "") -> str:
     lines: List[str] = []
     lines.append("Known pedal candidates:")
 
@@ -109,6 +127,8 @@ def build_structured_context(
             io_bits.append("mono out")
         if r.io.stereo_out:
             io_bits.append("stereo out")
+        if r.io.top_jacks is True:
+            io_bits.append("top jacks")
         if io_bits:
             pedal_lines.append(f"   I/O: {', '.join(io_bits)}")
 
@@ -128,14 +148,17 @@ def build_structured_context(
         if control_bits:
             pedal_lines.append(f"   Control: {', '.join(control_bits)}")
 
-        if r.size_mm.width is not None and r.size_mm.depth is not None:
-            pedal_lines.append(
-                f"   Size: {r.size_mm.width:.0f}mm x {r.size_mm.depth:.0f}mm"
-            )
+        if r.bypass and r.bypass != "unknown":
+            pedal_lines.append(f"   Bypass: {r.bypass}")
 
+        if r.size_mm.width is not None and r.size_mm.depth is not None:
+            pedal_lines.append(f"   Size: {r.size_mm.width:.0f}mm x {r.size_mm.depth:.0f}mm")
+
+        pedal_lines.append(f"   Record id: {r.id}")
         lines.extend(pedal_lines)
 
     total_ma = sum((r.power.current_ma or 0) for r in selected)
+    unknown_current = [r.id for r in selected if r.power.current_ma is None]
 
     if preferences.strip():
         lines.append("")
@@ -150,19 +173,21 @@ def build_structured_context(
     if selected:
         lines.append("")
         lines.append("Planning notes:")
-        lines.append(f"- Total current draw: {total_ma}mA")
-        lines.append("- Use isolated 9V outputs where needed")
+        lines.append(f"- Total current draw (known only): {total_ma}mA")
+        if unknown_current:
+            lines.append(f"- Missing current draw for: {', '.join(unknown_current)}")
+        lines.append("- Use isolated 9V outputs where needed (when applicable)")
 
     lines.append("")
     lines.append("Task:")
     lines.append("- Recommend a coherent signal chain and explain the reasoning.")
+    lines.append("- If something is unknown, say so—do not invent specs.")
 
     return "\n".join(lines)
 
 
-def build_raw_context(raw_request: str, selected: List[PedalRecord]) -> str:
-    lines: List[str] = [raw_request.strip()]
-
+def build_raw_context(user_prompt: str, selected: List[PedalRecord]) -> str:
+    lines: List[str] = [user_prompt.strip()]
     if selected:
         lines.append("")
         lines.append("Reference notes:")
@@ -180,7 +205,6 @@ def build_raw_context(raw_request: str, selected: List[PedalRecord]) -> str:
                 note_bits.append("MIDI")
             suffix = f" ({', '.join(note_bits)})" if note_bits else ""
             lines.append(f"- {r.name}{suffix}")
-
     return "\n".join(lines)
 
 
@@ -190,35 +214,16 @@ def build_raw_context(raw_request: str, selected: List[PedalRecord]) -> str:
 
 def ollama_controls(scope_key: str) -> Dict[str, object]:
     with st.expander("LLM narration (Ollama)", expanded=False):
-        use_llm = st.checkbox("Use Ollama to narrate", value=False, key=f"{scope_key}_use_ollama")
+        use_llm = st.checkbox("Use Ollama to narrate", value=True, key=f"{scope_key}_use_ollama")
         model = st.text_input("Ollama model", value="llama3.2:3b", key=f"{scope_key}_ollama_model")
         base_url = st.text_input("Ollama base URL", value="http://127.0.0.1:11434", key=f"{scope_key}_ollama_url")
-        st.caption("Filtering stays deterministic; Ollama just narrates from extracted facts + snippets.")
+        st.caption("Ollama is used as a narrator. Specs are constrained by extracted fields + snippets.")
     return {"use_llm": use_llm, "model": model, "base_url": base_url}
 
 
 # ---------------------------
-# Embeddings (sound search)
+# Embeddings search
 # ---------------------------
-
-@st.cache_data
-def load_embeddings(index_path: str) -> Tuple[List[str], np.ndarray]:
-    p = Path(index_path)
-    data = np.load(p, allow_pickle=False)
-    ids = data["ids"].tolist()
-    embs = data["embs"]  # normalized float32 [N, D]
-    return ids, embs
-
-
-@st.cache_resource
-def load_embed_model(model_name: str) -> SentenceTransformer:
-    return SentenceTransformer(model_name)
-
-
-def normalize_vec(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v) + 1e-12
-    return v / n
-
 
 def sound_search(
     query: str,
@@ -233,7 +238,7 @@ def sound_search(
     q = model.encode([query], convert_to_numpy=True)[0].astype(np.float32)
     q = normalize_vec(q)
 
-    sims = embs @ q  # cosine similarity (normalized)
+    sims = embs @ q
     if allowed_ids is not None:
         allowed = set(allowed_ids)
         mask = np.array([pid in allowed for pid in ids], dtype=bool)
@@ -242,59 +247,200 @@ def sound_search(
         sims = np.where(mask, sims, -1e9)
 
     idx = np.argsort(-sims)[:top_k]
-    results: List[Tuple[str, float]] = []
+    out: List[Tuple[str, float]] = []
     for i in idx:
         if sims[i] < -1e8:
             continue
-        results.append((ids[i], float(sims[i])))
-    return results
+        out.append((ids[i], float(sims[i])))
+    return out
 
 
 # ---------------------------
-# Merge mode (combined query -> sound + specs)
+# Merge mode splitter (combined prompt -> sound query + constraints)
 # ---------------------------
 
+_FILLER_PHRASES = [
+    r"\bi want\b",
+    r"\bi would like\b",
+    r"\bi'm looking for\b",
+    r"\bi am looking for\b",
+    r"\bcan you\b",
+    r"\bgive me\b",
+    r"\bhelp me\b",
+    r"\bif possible\b",
+    r"\bideally\b",
+    r"\bkind of\b",
+    r"\bsort of\b",
+    r"\bplease\b",
+]
+
+_SOUND_STOPWORDS = {
+    "i", "im", "i'm", "me", "my", "we", "our", "you",
+    "want", "like", "looking", "for", "a", "an", "the",
+    "something", "tone", "sound", "vibe", "kind", "sort",
+    "with", "and", "or", "but", "that", "this",
+    "to", "of", "in", "on", "at", "from",
+    "if", "possible", "ideally", "maybe",
+    "please", "thanks",
+    "it", "its", "it's",
+    "keep", "make", "get",
+}
+
+# Spec-ish tokens we don't want diluting vibe search (power + routing + flags)
 _SPEC_STOPWORDS = {
-    # constraint-ish keywords we strip from sound query
     "midi", "stereo", "mono", "in", "out", "input", "output",
     "expression", "exp", "tap", "tempo",
-    "true", "bypass", "buffered", "top", "jacks", "top-mounted", "topmounted",
+    "true", "bypass", "buffered", "switchable",
+    "top", "jacks", "top-mounted", "topmounted", "side",
     "type", "a", "b", "trs", "usb", "din",
     "under", "max", "<=", ">=", "less", "more",
     "v", "vdc", "volt", "volts", "ma", "mm", "cm", "inch", "inches",
-    "reverb", "delay", "drive", "tuner", "looper", "utility", "modulation", "multi", "fx",
+    "power", "isolated", "supply", "supplies", "cioks",
+    # keep these in constraints, not in the vibe vector
+    "tuner", "utility", "modulation", "multi", "fx", "effects",
 }
 
-def split_merge_query(merged: str) -> Tuple[str, str, dict]:
+def split_merge_query(merged: str) -> Tuple[str, dict]:
     """
-    Returns (sound_query, spec_query, parsed_constraints)
+    Returns (sound_query, parsed_constraints).
 
-    - spec_query is the original merged string (we let parse_question extract what it can)
-    - sound_query is the merged string with obvious constraint tokens removed
+    - parsed_constraints uses parse_question() (deterministic)
+    - sound_query is cleaned for embeddings: remove filler + spec chatter
     """
     merged = merged.strip()
     parsed = parse_question(merged)
 
-    # crude token cleanup for sound query: remove numbers+units and stopwords
     lower = merged.lower()
-    # remove numeric constraints (e.g., 9v, 500ma, 125mm)
+
+    # remove common filler phrases
+    for pat in _FILLER_PHRASES:
+        lower = re.sub(pat, " ", lower)
+
+    # remove numeric constraints (9v, 500ma, 125mm, etc.)
     lower = re.sub(r"\b\d+(\.\d+)?\s*(v|vdc|ma|mm|cm|in|inch|inches)\b", " ", lower)
-    # remove symbols
+
+    # remove punctuation but keep hyphens for "tape-ish"
     lower = re.sub(r"[^\w\s-]", " ", lower)
+
     tokens = [t for t in lower.split() if t.strip()]
 
-    kept = []
+    kept: List[str] = []
     for t in tokens:
+        if t in _SOUND_STOPWORDS:
+            continue
         if t in _SPEC_STOPWORDS:
             continue
-        # drop pure numbers
         if re.fullmatch(r"\d+(\.\d+)?", t):
             continue
         kept.append(t)
 
     sound_query = " ".join(kept).strip()
-    spec_query = merged
-    return sound_query, spec_query, parsed
+
+    # If we stripped too much, fallback to original (better than empty)
+    if not sound_query:
+        sound_query = merged
+
+    return sound_query, parsed
+
+
+def pick_fallback_pedals(records: List[PedalRecord], prompt: str, k: int) -> List[PedalRecord]:
+    """
+    If embeddings are missing, pick a reasonable default set:
+    - Start with a few known demo pedals if present
+    - Then fill by category hints in the prompt
+    """
+    by_id = {r.id: r for r in records}
+    defaults = [pid for pid in ["grit_drive", "canyon_delay", "cloudburst_reverb", "nexus_multi_fx"] if pid in by_id]
+    picked: List[PedalRecord] = [by_id[pid] for pid in defaults][:k]
+
+    want = prompt.lower()
+    cat_order = []
+    if "reverb" in want or "wash" in want or "ambient" in want:
+        cat_order.append("reverb")
+    if "delay" in want or "echo" in want:
+        cat_order.append("delay")
+    if "drive" in want or "distort" in want or "gain" in want:
+        cat_order.append("drive")
+    if "looper" in want or "loop" in want:
+        cat_order.append("looper")
+    if "tuner" in want:
+        cat_order.append("tuner")
+
+    for cat in cat_order:
+        for r in records:
+            if len(picked) >= k:
+                return picked
+            if r in picked:
+                continue
+            if r.category == cat:
+                picked.append(r)
+
+    # fill anything
+    for r in records:
+        if len(picked) >= k:
+            break
+        if r not in picked:
+            picked.append(r)
+    return picked[:k]
+
+
+def auto_select_pedals(
+    records: List[PedalRecord],
+    user_prompt: str,
+    *,
+    index_path: str,
+    embed_model: str,
+    top_k: int,
+    apply_constraints_first: bool,
+) -> Tuple[List[PedalRecord], Dict, str, List[Tuple[str, float]]]:
+    """
+    Returns: (selected_records, parsed_constraints, sound_query, scored_ids)
+    """
+    constraints = parse_question(user_prompt)
+    sound_q, _ = split_merge_query(user_prompt)
+    sound_query = sound_q if sound_q else user_prompt.strip()
+
+    # candidate set after deterministic constraints (optional)
+    allowed_ids: Optional[List[str]] = None
+    if apply_constraints_first and constraints:
+        filtered = apply_constraints(records, constraints)
+        allowed_ids = [r.id for r in filtered]
+
+    # embeddings path
+    p = Path(index_path)
+    if p.exists():
+        ids, embs = load_embeddings(index_path)
+        scored = sound_search(
+            query=sound_query,
+            ids=ids,
+            embs=embs,
+            model_name=embed_model,
+            top_k=max(top_k, 8),  # search a bit wider, then trim to those present in records
+            allowed_ids=allowed_ids,
+        )
+        by_id = {r.id: r for r in records}
+        chosen: List[PedalRecord] = []
+        for pid, _score in scored:
+            if pid in by_id and by_id[pid] not in chosen:
+                chosen.append(by_id[pid])
+            if len(chosen) >= top_k:
+                break
+        if not chosen:
+            # if constraints wiped it out, fallback within constraints or overall
+            chosen = pick_fallback_pedals(
+                apply_constraints(records, constraints) if constraints else records,
+                user_prompt,
+                top_k,
+            )
+        return chosen, constraints, sound_query, scored
+
+    # no embeddings: fallback
+    chosen = pick_fallback_pedals(
+        apply_constraints(records, constraints) if constraints else records,
+        user_prompt,
+        top_k,
+    )
+    return chosen, constraints, sound_query, []
 
 
 # ---------------------------
@@ -307,24 +453,157 @@ records = cached_records(records_path)
 
 tabs = st.tabs(
     [
-        "Search (Question Mode)",
+        "Demo: One-Prompt (Raw vs Structured)",
+        "Constraint Finder",
+        "Vibe Search (Embeddings)",
         "Board Builder",
-        "Prompt Comparison",
-        "Sound Search (Embeddings)",
         "Browse Data",
     ]
 )
 
-# --- Tab 1: Question mode ---
+# -------------------------------------------------------------------
+# TAB 0: HERO DEMO (one prompt)
+# -------------------------------------------------------------------
 with tabs[0]:
-    st.subheader("Ask a constraint-style question")
-    q = st.text_input(
-        'Try: "reverbs with expression under 125mm" or "midi stereo out 9v" or "top jacks true bypass"',
-        key="question_mode_input",
+    st.subheader("Demo: One-Prompt (Raw vs Structured)")
+    st.caption("Type one natural-language prompt. The app auto-selects pedals, builds Raw vs Structured context, and optionally runs Ollama.")
+
+    user_prompt = st.text_area(
+        "Your prompt",
+        value="I want a distorted, washy delay tone. Stereo if possible. I use 9V isolated power.",
+        height=90,
+        key="one_prompt_input",
     )
 
-    explain = st.checkbox("Explain eliminations", value=False, key="question_mode_explain")
-    llm_cfg = ollama_controls("question_mode")
+    with st.expander("Advanced (optional)", expanded=False):
+        index_path = st.text_input("Embeddings index path", value="out/embeddings.npz", key="one_prompt_index")
+        embed_model = st.text_input("Embedding model", value="sentence-transformers/all-MiniLM-L6-v2", key="one_prompt_emb_model")
+        top_k = st.slider("How many pedals to select", min_value=2, max_value=8, value=5, step=1, key="one_prompt_topk")
+        apply_constraints_first = st.checkbox(
+            "Apply parsed spec constraints before embeddings",
+            value=True,
+            key="one_prompt_apply_constraints_first",
+            help="If enabled: deterministic filters narrow candidates, then embeddings rank only within that set.",
+        )
+        show_explain = st.checkbox("Show elimination explain table", value=False, key="one_prompt_explain")
+
+    llm_cfg = ollama_controls("one_prompt_llm")
+    run = st.button("Run demo", key="one_prompt_run")
+
+    if run:
+        index_path = st.session_state.get("one_prompt_index", "out/embeddings.npz")
+        embed_model = st.session_state.get("one_prompt_emb_model", "sentence-transformers/all-MiniLM-L6-v2")
+        top_k = int(st.session_state.get("one_prompt_topk", 5))
+        apply_constraints_first = bool(st.session_state.get("one_prompt_apply_constraints_first", True))
+        show_explain = bool(st.session_state.get("one_prompt_explain", False))
+
+        selected, constraints, sound_query, scored = auto_select_pedals(
+            records,
+            user_prompt,
+            index_path=index_path,
+            embed_model=embed_model,
+            top_k=top_k,
+            apply_constraints_first=apply_constraints_first,
+        )
+
+        st.markdown("### What the code inferred")
+        st.write(f"- Parsed constraints: `{constraints}`")
+        st.write(f"- Sound query used for embeddings: **{sound_query}**")
+        if scored:
+            st.write("- Embedding top hits (id, score):")
+            preview = [{"id": pid, "score": round(score, 4)} for pid, score in scored[:10]]
+            st.dataframe(preview, use_container_width=True)
+        else:
+            st.caption("No embeddings scores (index missing or fallback selection used).")
+
+        if show_explain and constraints:
+            st.markdown("### Explain eliminations (based on parsed constraints)")
+            eliminated_rows = build_elimination_rows(records, constraints)
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Matched (constraints)", len(apply_constraints(records, constraints)))
+            with col_b:
+                st.metric("Eliminated", len(eliminated_rows))
+            with col_c:
+                st.metric("Total", len(records))
+            if eliminated_rows:
+                st.dataframe(eliminated_rows, use_container_width=True)
+            else:
+                st.caption("Nothing eliminated by constraints.")
+
+        st.markdown("### Auto-selected pedals")
+        st.dataframe([record_row(r) for r in selected], use_container_width=True)
+
+        preferences_text = sound_query
+        constraints_text = ", ".join([f"{k}={v}" for k, v in constraints.items()]) if constraints else ""
+
+        raw_context = build_raw_context(user_prompt, selected)
+        structured_context = build_structured_context(selected, preferences_text, constraints_text)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### Raw context")
+            st.code(raw_context, language="text")
+        with c2:
+            st.markdown("### Structured context")
+            st.code(structured_context, language="text")
+
+        if llm_cfg["use_llm"]:
+            st.markdown("### Ollama outputs (Raw vs Structured)")
+            q_llm = (
+                "Recommend a coherent signal chain and explain the reasoning. "
+                "If something is unknown, say so—do not invent specs."
+            )
+
+            o1, o2 = st.columns(2)
+            with o1:
+                with st.spinner("Asking Ollama (raw)..."):
+                    try:
+                        ans_raw = ollama_narrate(
+                            question=q_llm + "\n\n" + raw_context,
+                            matches=selected,
+                            model=str(llm_cfg["model"]),
+                            base_url=str(llm_cfg["base_url"]),
+                        )
+                        st.markdown("#### Raw → Ollama")
+                        st.write(ans_raw)
+                    except Exception as e:
+                        st.error(f"Ollama error (raw): {e}")
+
+            with o2:
+                with st.spinner("Asking Ollama (structured)..."):
+                    try:
+                        ans_struct = ollama_narrate(
+                            question=q_llm + "\n\n" + structured_context,
+                            matches=selected,
+                            model=str(llm_cfg["model"]),
+                            base_url=str(llm_cfg["base_url"]),
+                        )
+                        st.markdown("#### Structured → Ollama")
+                        st.write(ans_struct)
+                    except Exception as e:
+                        st.error(f"Ollama error (structured): {e}")
+
+        st.markdown("### Inspect sources")
+        if selected:
+            pick_src = st.selectbox("Pick a pedal", options=[r.id for r in selected], key="one_prompt_pick_sources")
+            rr = next(r for r in selected if r.id == pick_src)
+            show_sources(rr)
+
+# -------------------------------------------------------------------
+# TAB 1: Constraint Finder
+# -------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("Constraint Finder")
+    st.caption("Deterministic constraints over extracted fields. Great for spec questions.")
+
+    q = st.text_input(
+        'Try: "reverbs with expression under 125mm" or "midi stereo out 9v" or "top jacks true bypass"',
+        key="constraint_finder_input",
+    )
+
+    explain = st.checkbox("Explain eliminations", value=False, key="constraint_finder_explain")
+    llm_cfg = ollama_controls("constraint_finder_llm")
 
     if q:
         c = parse_question(q)
@@ -340,17 +619,14 @@ with tabs[0]:
                 st.metric("Eliminated", len(eliminated_rows))
             with col_c:
                 st.metric("Total", len(records))
-
             if eliminated_rows:
-                st.markdown("### Why pedals were eliminated")
                 st.dataframe(eliminated_rows, use_container_width=True)
 
         st.write(f"Matches: {len(results)}")
 
         if results:
             st.dataframe([record_row(r) for r in results], use_container_width=True)
-            st.markdown("### Inspect sources")
-            pick = st.selectbox("Pick a result", options=[r.id for r in results], key="question_mode_pick")
+            pick = st.selectbox("Pick a result", options=[r.id for r in results], key="constraint_pick")
             rr = next(r for r in results if r.id == pick)
             show_sources(rr)
         else:
@@ -359,173 +635,44 @@ with tabs[0]:
         if llm_cfg["use_llm"]:
             st.markdown("### LLM narration")
             with st.spinner("Asking Ollama..."):
-                try:
-                    ans = ollama_narrate(
-                        question=q,
-                        matches=results,
-                        model=str(llm_cfg["model"]),
-                        base_url=str(llm_cfg["base_url"]),
-                    )
-                    st.write(ans)
-                except Exception as e:
-                    st.error(f"Ollama error: {e}")
-    else:
-        st.info("Enter a question above to route it to structured filters.")
+                ans = ollama_narrate(
+                    question=q,
+                    matches=results,
+                    model=str(llm_cfg["model"]),
+                    base_url=str(llm_cfg["base_url"]),
+                )
+                st.write(ans)
 
-# --- Tab 2: Board builder ---
-with tabs[1]:
-    st.subheader("Board Builder")
-    st.caption("Pick pedals → see power budget + MIDI chain + quick red flags.")
-
-    options = {r.id: f"{r.name} ({r.category})" for r in records}
-    selected_ids = st.multiselect(
-        "Select pedals",
-        options=list(options.keys()),
-        format_func=lambda x: options[x],
-        key="board_builder_select",
-    )
-    selected = [r for r in records if r.id in selected_ids]
-
-    col1, col2, col3 = st.columns(3)
-    total_ma = sum((r.power.current_ma or 0) for r in selected)
-    unknown_current = [r for r in selected if r.power.current_ma is None]
-
-    with col1:
-        st.metric("Total current draw (mA)", total_ma)
-        if unknown_current:
-            st.warning(f"{len(unknown_current)} pedal(s) missing current draw: " + ", ".join(r.id for r in unknown_current))
-
-    with col2:
-        midi_pedals = [r for r in selected if r.control.midi]
-        st.metric("MIDI-capable pedals", len(midi_pedals))
-        if midi_pedals:
-            st.write("MIDI list:")
-            for r in midi_pedals:
-                st.write(f"- {r.name} — {r.control.midi_type} ({r.control.trs_midi_type})")
-
-    with col3:
-        stereo_out = [r for r in selected if r.io.stereo_out]
-        st.metric("Stereo-out pedals", len(stereo_out))
-
-    st.markdown("### Selected pedals")
-    if selected:
-        st.dataframe([record_row(r) for r in selected], use_container_width=True)
-        st.markdown("### Inspect sources for a selected pedal")
-        pick2 = st.selectbox("Pick a pedal", options=[r.id for r in selected], key="board_builder_pick")
-        rr2 = next(r for r in selected if r.id == pick2)
-        show_sources(rr2)
-    else:
-        st.info("Select pedals to build a board.")
-
-# --- Tab 3: Prompt Comparison ---
+# -------------------------------------------------------------------
+# TAB 2: Vibe Search (Embeddings)
+# -------------------------------------------------------------------
 with tabs[2]:
-    st.subheader("Prompt Comparison")
-    st.caption("See how the same user intent looks as raw context versus structured context.")
+    st.subheader("Vibe Search (Embeddings)")
+    st.caption("Free-text ‘sound/vibe’ similarity over the entire pedal notes. Specs remain deterministic via constraints.")
 
-    options_pc = {r.id: f"{r.name} ({r.category})" for r in records}
-    default_prompt_ids = ["grit_drive", "canyon_delay", "cloudburst_reverb"]
-    prompt_defaults = [pid for pid in default_prompt_ids if pid in options_pc]
+    index_path = st.text_input("Embeddings index path", value="out/embeddings.npz", key="vibe_index_path")
+    embed_model = st.text_input("Embedding model", value="sentence-transformers/all-MiniLM-L6-v2", key="vibe_emb_model")
 
-    selected_ids_pc = st.multiselect(
-        "Select pedals for comparison",
-        options=list(options_pc.keys()),
-        format_func=lambda x: options_pc[x],
-        default=prompt_defaults,
-        key="prompt_compare_select",
-    )
-    selected_pc = [r for r in records if r.id in selected_ids_pc]
-
-    raw_request = st.text_area(
-        "Raw user request",
-        value=(
-            "I want something with a Grit Drive, maybe the Canyon delay, "
-            "and a huge ambient verb. I use a CIOKS. I still want to stack gain sometimes."
-        ),
-        height=120,
-        key="prompt_compare_raw_request",
-    )
-
-    preferences = st.text_input("Preferences", value="ambient textures, gain stacking", key="prompt_compare_preferences")
-    constraints = st.text_input("Constraints", value="9V isolated power planning", key="prompt_compare_constraints")
-
-    raw_context = build_raw_context(raw_request, selected_pc)
-    structured_context = build_structured_context(selected_pc, preferences, constraints)
-
-    col_left, col_right = st.columns(2)
-    with col_left:
-        st.markdown("### Raw context")
-        st.code(raw_context, language="text")
-    with col_right:
-        st.markdown("### Structured context")
-        st.code(structured_context, language="text")
-
-    st.markdown("### Prompt-ready task block")
-    st.code(structured_context + "\n\nReturn a signal chain recommendation with a short explanation.", language="text")
-
-    llm_cfg_pc = ollama_controls("prompt_compare")
-    if llm_cfg_pc["use_llm"]:
-        st.markdown("### LLM narration (from selected pedals)")
-        with st.spinner("Asking Ollama..."):
-            ans = ollama_narrate(
-                question="Recommend a coherent signal chain given these pedals and constraints.",
-                matches=selected_pc,
-                model=str(llm_cfg_pc["model"]),
-                base_url=str(llm_cfg_pc["base_url"]),
-            )
-            st.write(ans)
-
-# --- Tab 4: Sound Search (Embeddings) ---
-with tabs[3]:
-    st.subheader("Sound Search (Embeddings)")
-    st.caption("Free-text vibe search over the *entire pedal notes*. Specs remain deterministic elsewhere.")
-
-    index_path = st.text_input("Embeddings index path", value="out/embeddings.npz", key="emb_index_path")
-    embed_model = st.text_input("Embedding model", value="sentence-transformers/all-MiniLM-L6-v2", key="emb_model_name")
-
-    st.markdown("### Merge mode (combined query)")
-    merged = st.text_input(
-        'Try: "huge ambient wash reverb, but must be stereo out + midi + 9v"',
-        key="merge_query",
-    )
-    use_merge = st.checkbox("Use merge mode", value=False, key="merge_enable")
+    merged = st.text_input('Merge mode: "ambient wash reverb but must be midi stereo out 9v"', key="vibe_merge")
+    use_merge = st.checkbox("Use merge mode", value=False, key="vibe_merge_enable")
 
     sound_q = ""
-    spec_q = ""
-    parsed_constraints = None
-
+    constraints = {}
     if use_merge and merged.strip():
-        sound_q, spec_q, parsed_constraints = split_merge_query(merged)
-        st.caption(f"Parsed constraints: {parsed_constraints}")
+        sound_q, constraints = split_merge_query(merged)
+        st.caption(f"Parsed constraints: {constraints}")
         st.write(f"Sound query extracted: **{sound_q or '(empty)'}**")
-        st.write(f"Spec query (for constraints parser): **{spec_q}**")
 
-    st.markdown("### Sound query")
     colx, coly = st.columns([2, 1])
     with colx:
-        sound_q_input = st.text_input(
-            'Try: "huge ambient wash, modulated trails" or "tight mid gain that stacks well"',
-            value=sound_q,
-            key="sound_query",
-        )
+        sound_q_input = st.text_input("Sound query", value=sound_q, key="vibe_sound_query")
     with coly:
-        top_k = st.slider("Top K", min_value=3, max_value=20, value=8, step=1, key="sound_topk")
+        top_k = st.slider("Top K", 3, 20, 8, 1, key="vibe_topk")
 
-    st.markdown("### Optional: spec constraints first")
-    apply_specs_first = st.checkbox(
-        "Apply spec constraints first",
-        value=bool(use_merge and merged.strip()),
-        key="sound_apply_specs_first",
-    )
+    apply_specs_first = st.checkbox("Apply constraints first", value=bool(constraints), key="vibe_apply_specs_first")
+    spec_query = st.text_input('Spec constraints string (optional)', value=(merged if apply_specs_first else ""), key="vibe_spec_query")
 
-    spec_query = st.text_input(
-        'Spec constraints (same format as Question Mode), e.g. "midi stereo out 9v" or "reverb expression"',
-        value=(spec_q if apply_specs_first else ""),
-        key="sound_spec_query",
-    )
-
-    run = st.button("Run sound search", key="sound_run")
-
-    if run:
+    if st.button("Run vibe search", key="vibe_run"):
         p = Path(index_path)
         if not p.exists():
             st.error(f"Embeddings index not found: {index_path}")
@@ -534,16 +681,12 @@ with tabs[3]:
             st.warning("Enter a sound/vibe query first.")
         else:
             ids, embs = load_embeddings(index_path)
-
             allowed_ids = None
             if apply_specs_first and spec_query.strip():
                 c = parse_question(spec_query)
                 filtered = apply_constraints(records, c)
                 allowed_ids = [r.id for r in filtered]
                 st.caption(f"Candidate set after deterministic constraints: {len(allowed_ids)}")
-                if len(allowed_ids) == 0:
-                    st.warning("No candidates left after constraints. Relax the spec constraints.")
-                    st.stop()
 
             results = sound_search(
                 query=sound_q_input.strip(),
@@ -555,7 +698,7 @@ with tabs[3]:
             )
 
             if not results:
-                st.info("No results (or all candidates filtered out).")
+                st.info("No results.")
             else:
                 by_id = {r.id: r for r in records}
                 rows: List[Dict] = []
@@ -566,27 +709,53 @@ with tabs[3]:
                     row = record_row(r)
                     row["score"] = round(score, 4)
                     rows.append(row)
-
-                st.markdown("### Ranked results")
                 st.dataframe(rows, use_container_width=True)
+                pick = st.selectbox("Inspect sources", options=[r["id"] for r in rows], key="vibe_pick")
+                show_sources(by_id[pick])
 
-                pick_sound = st.selectbox("Inspect sources for a result", options=[r["id"] for r in rows], key="sound_pick")
-                rr = by_id[pick_sound]
-                show_sources(rr)
+# -------------------------------------------------------------------
+# TAB 3: Board Builder
+# -------------------------------------------------------------------
+with tabs[3]:
+    st.subheader("Board Builder")
+    st.caption("Pick pedals → see power budget + MIDI list + red flags.")
 
-                st.markdown("### Notes")
-                st.markdown(
-                    "- Sound search is fuzzy ranking over the full note text.\n"
-                    "- Constraints remain deterministic (extractors + filters).\n"
-                    "- Merge mode is a heuristic split: good for demos, not perfect NLP."
-                )
+    options = {r.id: f"{r.name} ({r.category})" for r in records}
+    selected_ids = st.multiselect("Select pedals", list(options.keys()), format_func=lambda x: options[x], key="board_select")
+    selected = [r for r in records if r.id in selected_ids]
 
-# --- Tab 5: Browse ---
+    col1, col2, col3 = st.columns(3)
+    total_ma = sum((r.power.current_ma or 0) for r in selected)
+    unknown_current = [r for r in selected if r.power.current_ma is None]
+
+    with col1:
+        st.metric("Total current draw (mA)", total_ma)
+        if unknown_current:
+            st.warning("Missing current draw for: " + ", ".join(r.id for r in unknown_current))
+
+    with col2:
+        midi_pedals = [r for r in selected if r.control.midi]
+        st.metric("MIDI-capable pedals", len(midi_pedals))
+        for r in midi_pedals:
+            st.write(f"- {r.name} — {r.control.midi_type} ({r.control.trs_midi_type})")
+
+    with col3:
+        stereo_out = [r for r in selected if r.io.stereo_out]
+        st.metric("Stereo-out pedals", len(stereo_out))
+
+    if selected:
+        st.dataframe([record_row(r) for r in selected], use_container_width=True)
+        pick = st.selectbox("Inspect sources", options=[r.id for r in selected], key="board_pick")
+        rr = next(r for r in selected if r.id == pick)
+        show_sources(rr)
+
+# -------------------------------------------------------------------
+# TAB 4: Browse Data
+# -------------------------------------------------------------------
 with tabs[4]:
     st.subheader("All extracted records")
     st.dataframe([record_row(r) for r in records], use_container_width=True)
 
-    st.markdown("### Inspect sources")
-    pick3 = st.selectbox("Pick any pedal", options=[r.id for r in records], key="pick_all")
-    rr3 = next(r for r in records if r.id == pick3)
-    show_sources(rr3)
+    pick = st.selectbox("Inspect sources", options=[r.id for r in records], key="browse_pick")
+    rr = next(r for r in records if r.id == pick)
+    show_sources(rr)

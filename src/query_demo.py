@@ -49,7 +49,9 @@ def power_check(records: List[PedalRecord], pedal_id: str, supply_ma: int = 100,
 
     ok = (abs(rec.power.voltage_v - voltage_v) < 0.01) and (rec.power.current_ma <= supply_ma)
     verdict = "OK" if ok else "NO"
-    print(f"Supply: {voltage_v:.0f}V {supply_ma}mA  |  Pedal: {rec.power.voltage_v:.0f}V {rec.power.current_ma}mA  =>  {verdict}")
+    print(
+        f"Supply: {voltage_v:.0f}V {supply_ma}mA  |  Pedal: {rec.power.voltage_v:.0f}V {rec.power.current_ma}mA  =>  {verdict}"
+    )
 
     src_v = rec.sources.get("power.voltage_v")
     src_c = rec.sources.get("power.current_ma")
@@ -65,11 +67,50 @@ def parse_question(q: str) -> dict:
     ql = q.lower()
     c: dict = {}
 
-    # category hints
-    for cat in ["reverb", "delay", "drive", "tuner", "looper", "utility", "modulation", "multi"]:
-        if cat in ql:
-            c["category"] = "multi_fx" if cat == "multi" else cat
-            break
+    # category hints (improved: avoid forcing a single category when the prompt implies multiple effects)
+    cats = set()
+
+    # reverb-ish
+    if ("reverb" in ql) or ("washy" in ql) or ("wash" in ql) or ("ambient" in ql) or ("shimmer" in ql):
+        cats.add("reverb")
+
+    # delay-ish
+    if ("delay" in ql) or ("echo" in ql) or ("repeats" in ql):
+        cats.add("delay")
+
+    # drive-ish
+    if (
+        ("drive" in ql)
+        or ("distort" in ql)
+        or ("distortion" in ql)
+        or ("gain" in ql)
+        or ("fuzz" in ql)
+        or ("overdrive" in ql)
+    ):
+        cats.add("drive")
+
+    # other categories
+    if "tuner" in ql:
+        cats.add("tuner")
+    if ("looper" in ql) or ("loop" in ql):
+        cats.add("looper")
+    if (
+        ("modulation" in ql)
+        or ("chorus" in ql)
+        or ("phaser" in ql)
+        or ("flanger" in ql)
+        or ("tremolo" in ql)
+    ):
+        cats.add("modulation")
+
+    # multi-fx hint
+    if "multi" in ql and ("fx" in ql or "effects" in ql):
+        cats.add("multi_fx")
+
+    # Only set category if it is unambiguous (exactly one category).
+    # If user implies multiple (e.g., drive + delay + reverb), do NOT hard constrain.
+    if len(cats) == 1:
+        c["category"] = next(iter(cats))
 
     # booleans
     if "midi" in ql:
@@ -130,8 +171,8 @@ def parse_question(q: str) -> dict:
 @dataclass(frozen=True)
 class EvalResult:
     passed: bool
-    failures: List[str]          # human-readable reasons
-    first_failure: Optional[str] # first failing rule (for quick scan)
+    failures: List[str]           # human-readable reasons
+    first_failure: Optional[str]  # first failing rule (for quick scan)
 
 
 def _cmp_float(a: Optional[float], b: float, tol: float = 0.01) -> bool:
@@ -141,7 +182,6 @@ def _cmp_float(a: Optional[float], b: float, tol: float = 0.01) -> bool:
 def evaluate_constraints(r: PedalRecord, c: dict) -> EvalResult:
     failures: List[str] = []
 
-    # Helper to add + keep stable ordering
     def fail(msg: str) -> None:
         failures.append(msg)
 
@@ -248,10 +288,8 @@ def explain_constraints(records: List[PedalRecord], c: dict, max_items: int = 20
         print("Nothing eliminated — all records matched the constraints (unlikely, but possible).")
         return
 
-    # limit output
     rows = rows[:max_items]
 
-    # pretty print
     id_w = max(len("id"), max(len(x[0]) for x in rows))
     name_w = max(len("name"), max(len(x[1]) for x in rows))
     first_w = max(len("first_failure"), min(48, max(len(x[2]) for x in rows)))
@@ -303,10 +341,8 @@ def main() -> int:
 
     ap.add_argument("--question", default=None, help='Natural language question, e.g. "reverbs with expression under 125mm"')
 
-    # Explainability
     ap.add_argument("--explain", action="store_true", help="Print why each pedal did/didn't match constraints")
 
-    # LLM narration (Ollama)
     ap.add_argument("--ollama", action="store_true", help="Use Ollama to narrate results (filtering remains deterministic)")
     ap.add_argument("--model", default="llama3.2:3b", help="Ollama model name, e.g. llama3.2:3b")
     ap.add_argument("--ollama_url", default="http://127.0.0.1:11434", help="Ollama base URL")
@@ -338,7 +374,6 @@ def main() -> int:
 
         return 0
 
-    # Default demo mode
     power_check(records, args.power_pedal_id, supply_ma=100, voltage_v=9.0)
 
     shortlist = filter_midi_stereo_9v(records)
