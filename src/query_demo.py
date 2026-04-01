@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import argparse
 import re
-from typing import List
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
 
 from src.schema import PedalRecord
 from src.llm_answer import ollama_narrate
@@ -92,7 +93,7 @@ def parse_question(q: str) -> dict:
     if "tap tempo" in ql or ("tap" in ql and "tempo" in ql):
         c["tap_tempo"] = True
 
-    if "top jacks" in ql or "top-mounted" in ql:
+    if "top jacks" in ql or "top-mounted" in ql or "top mounted" in ql:
         c["top_jacks"] = True
 
     if "true bypass" in ql:
@@ -112,6 +113,7 @@ def parse_question(q: str) -> dict:
 
     mma = re.search(r"\b(\d{2,4})\s*ma\b", ql)
     if mma:
+        # interpret as max current unless question suggests otherwise
         if re.search(r"\bunder\b|\b<=\b|\bless\b|\bmax\b", ql):
             c["max_current_ma"] = int(mma.group(1))
 
@@ -123,51 +125,146 @@ def parse_question(q: str) -> dict:
     return c
 
 
+# ---------- Explainable filtering ----------
+
+@dataclass(frozen=True)
+class EvalResult:
+    passed: bool
+    failures: List[str]          # human-readable reasons
+    first_failure: Optional[str] # first failing rule (for quick scan)
+
+
+def _cmp_float(a: Optional[float], b: float, tol: float = 0.01) -> bool:
+    return a is not None and abs(a - b) <= tol
+
+
+def evaluate_constraints(r: PedalRecord, c: dict) -> EvalResult:
+    failures: List[str] = []
+
+    # Helper to add + keep stable ordering
+    def fail(msg: str) -> None:
+        failures.append(msg)
+
+    # Category
+    if "category" in c and r.category != c["category"]:
+        fail(f"category != {c['category']} (got {r.category})")
+
+    # MIDI required/forbidden
+    if "midi" in c:
+        if r.control.midi is None:
+            fail(f"midi unknown (need {c['midi']})")
+        elif r.control.midi != c["midi"]:
+            fail(f"midi != {c['midi']} (got {r.control.midi})")
+
+    # TRS MIDI type
+    if c.get("trs_midi_type"):
+        if r.control.trs_midi_type == "unknown":
+            fail(f"trs_midi_type unknown (need {c['trs_midi_type']})")
+        elif r.control.trs_midi_type != c["trs_midi_type"]:
+            fail(f"trs_midi_type != {c['trs_midi_type']} (got {r.control.trs_midi_type})")
+
+    # Bypass
+    if c.get("bypass"):
+        if r.bypass == "unknown":
+            fail(f"bypass unknown (need {c['bypass']})")
+        elif r.bypass != c["bypass"]:
+            fail(f"bypass != {c['bypass']} (got {r.bypass})")
+
+    # Stereo requirements
+    if c.get("stereo_out") is True and r.io.stereo_out is not True:
+        got = r.io.stereo_out
+        fail(f"stereo_out not true (got {got})")
+    if c.get("stereo_in") is True and r.io.stereo_in is not True:
+        got = r.io.stereo_in
+        fail(f"stereo_in not true (got {got})")
+
+    # Expression / tap / top jacks
+    if c.get("expression") is True and r.control.expression is not True:
+        got = r.control.expression
+        fail(f"expression not true (got {got})")
+    if c.get("tap_tempo") is True and r.control.tap_tempo is not True:
+        got = r.control.tap_tempo
+        fail(f"tap_tempo not true (got {got})")
+    if c.get("top_jacks") is True and r.io.top_jacks is not True:
+        got = r.io.top_jacks
+        fail(f"top_jacks not true (got {got})")
+
+    # Voltage
+    if "voltage_v" in c:
+        if r.power.voltage_v is None:
+            fail(f"voltage unknown (need {c['voltage_v']}V)")
+        elif not _cmp_float(r.power.voltage_v, float(c["voltage_v"])):
+            fail(f"voltage != {c['voltage_v']}V (got {r.power.voltage_v}V)")
+
+    # Max current draw
+    if "max_current_ma" in c:
+        if r.power.current_ma is None:
+            fail(f"current draw unknown (need <= {c['max_current_ma']}mA)")
+        elif r.power.current_ma > int(c["max_current_ma"]):
+            fail(f"current draw > {c['max_current_ma']}mA (got {r.power.current_ma}mA)")
+
+    # Max width
+    if "max_width_mm" in c:
+        if r.size_mm.width is None:
+            fail(f"width unknown (need <= {c['max_width_mm']}mm)")
+        elif r.size_mm.width > float(c["max_width_mm"]):
+            fail(f"width > {c['max_width_mm']}mm (got {r.size_mm.width}mm)")
+
+    passed = len(failures) == 0
+    return EvalResult(passed=passed, failures=failures, first_failure=(failures[0] if failures else None))
+
+
 def apply_constraints(records: List[PedalRecord], c: dict) -> List[PedalRecord]:
     out: List[PedalRecord] = []
     for r in records:
-        if "category" in c and r.category != c["category"]:
-            continue
-
-        if "midi" in c:
-            if r.control.midi is None:
-                continue
-            if r.control.midi != c["midi"]:
-                continue
-
-        if c.get("trs_midi_type") and r.control.trs_midi_type != c["trs_midi_type"]:
-            continue
-
-        if c.get("bypass") and r.bypass != c["bypass"]:
-            continue
-
-        if c.get("stereo_out") is True and r.io.stereo_out is not True:
-            continue
-        if c.get("stereo_in") is True and r.io.stereo_in is not True:
-            continue
-
-        if c.get("expression") is True and r.control.expression is not True:
-            continue
-        if c.get("tap_tempo") is True and r.control.tap_tempo is not True:
-            continue
-        if c.get("top_jacks") is True and r.io.top_jacks is not True:
-            continue
-
-        if "voltage_v" in c:
-            if r.power.voltage_v is None or abs(r.power.voltage_v - c["voltage_v"]) > 0.01:
-                continue
-
-        if "max_current_ma" in c:
-            if r.power.current_ma is None or r.power.current_ma > c["max_current_ma"]:
-                continue
-
-        if "max_width_mm" in c:
-            if r.size_mm.width is None or r.size_mm.width > c["max_width_mm"]:
-                continue
-
-        out.append(r)
-
+        if evaluate_constraints(r, c).passed:
+            out.append(r)
     return out
+
+
+def explain_constraints(records: List[PedalRecord], c: dict, max_items: int = 200) -> None:
+    print("\n=== Explain mode ===")
+    print("Constraints:")
+    for k in sorted(c.keys()):
+        print(f"- {k}: {c[k]}")
+    print("")
+
+    rows: List[Tuple[str, str, str, str]] = []
+    passed_count = 0
+
+    for r in records:
+        ev = evaluate_constraints(r, c)
+        if ev.passed:
+            passed_count += 1
+            continue
+
+        all_reasons = "; ".join(ev.failures)
+        rows.append((r.id, r.name, ev.first_failure or "", all_reasons))
+
+    print(f"Matched: {passed_count} / {len(records)}")
+    print(f"Eliminated: {len(records) - passed_count} / {len(records)}\n")
+
+    if not rows:
+        print("Nothing eliminated — all records matched the constraints (unlikely, but possible).")
+        return
+
+    # limit output
+    rows = rows[:max_items]
+
+    # pretty print
+    id_w = max(len("id"), max(len(x[0]) for x in rows))
+    name_w = max(len("name"), max(len(x[1]) for x in rows))
+    first_w = max(len("first_failure"), min(48, max(len(x[2]) for x in rows)))
+
+    header = f"{'id'.ljust(id_w)}  {'name'.ljust(name_w)}  {'first_failure'.ljust(first_w)}  reasons"
+    print(header)
+    print("-" * len(header))
+
+    for pid, pname, first, reasons in rows:
+        first_short = (first[:45] + "…") if len(first) > 48 else first
+        print(f"{pid.ljust(id_w)}  {pname.ljust(name_w)}  {first_short.ljust(first_w)}  {reasons}")
+
+    print("\nTip: This output is great for demos. You can literally show why a pedal was filtered out.")
 
 
 # ---------- Original demo filters ----------
@@ -206,9 +303,12 @@ def main() -> int:
 
     ap.add_argument("--question", default=None, help='Natural language question, e.g. "reverbs with expression under 125mm"')
 
+    # Explainability
+    ap.add_argument("--explain", action="store_true", help="Print why each pedal did/didn't match constraints")
+
     # LLM narration (Ollama)
     ap.add_argument("--ollama", action="store_true", help="Use Ollama to narrate results (filtering remains deterministic)")
-    ap.add_argument("--model", default="llama3.2:3b", help="Ollama model name, e.g. llama3.2:3b or llama3.1:8b")
+    ap.add_argument("--model", default="llama3.2:3b", help="Ollama model name, e.g. llama3.2:3b")
     ap.add_argument("--ollama_url", default="http://127.0.0.1:11434", help="Ollama base URL")
 
     args = ap.parse_args()
@@ -216,17 +316,19 @@ def main() -> int:
 
     if args.question:
         c = parse_question(args.question)
-        results = apply_constraints(records, c)
 
-        # Always print shortlist (useful even if LLM fails)
+        if args.explain:
+            explain_constraints(records, c)
+
+        results = apply_constraints(records, c)
         print_shortlist(f'Question: "{args.question}"', results)
 
         if args.ollama:
             print("\n=== LLM narration (Ollama) ===")
             try:
                 answer = ollama_narrate(
-                    args.question,
-                    results,
+                    question=args.question,
+                    matches=results,
                     model=args.model,
                     base_url=args.ollama_url,
                 )
