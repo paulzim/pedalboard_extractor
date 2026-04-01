@@ -169,6 +169,28 @@ CLI demo:
 - applies deterministic filters to return a shortlist
 - optional `--ollama` mode for narrated answers via `llm_answer.py`
 
+### `src/rag_index.py`
+Embeddings index builder:
+- reads the **entire pedal note text** from `data/pedals/*.txt`
+- builds sentence-transformer embeddings (default: `all-MiniLM-L6-v2`)
+- writes a normalized vector index to `out/embeddings.npz` (`ids` + `embs`)
+
+Run:
+```bash
+python -m src.rag_index --data_dir data/pedals --out_dir out
+```
+
+### `src/rag_search.py`
+Embeddings search helper (cosine similarity):
+- loads `out/embeddings.npz`
+- embeds a free-text “sound/vibe” query
+- returns the top-k matching pedal IDs + similarity scores
+
+Run:
+```bash
+python -m src.rag_search --index out/embeddings.npz --query "huge ambient wash, modulated trails" --top_k 5
+```
+
 ### `src/llm_answer.py`
 Ollama integration:
 - calls `http://127.0.0.1:11434/api/chat`
@@ -196,4 +218,3 @@ Extractors solve that by:
 - letting the LLM do what it’s good at: **explaining and summarizing**, not guessing.
 
 ---
-
