@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import re
-from typing import List, Optional, Tuple
+from typing import List
 
-from .schema import PedalRecord
+from src.schema import PedalRecord
+from src.llm_answer import ollama_narrate
 
 
 def load_records(path: str) -> List[PedalRecord]:
@@ -28,7 +29,10 @@ def print_shortlist(title: str, items: List[PedalRecord], max_items: int = 50) -
         stereo = "st-out" if r.io.stereo_out else ("mono" if r.io.mono_out else "out?")
         top = "top" if r.io.top_jacks else ("side" if r.io.top_jacks is False else "jacks?")
         bp = r.bypass
-        print(f"- {r.id:18s} | {r.name:22s} | {r.category:8s} | {v:3s} {ma:6s} | {midi:12s} | {stereo:6s} | {top:6s} | {bp:10s} | width {w}")
+        print(
+            f"- {r.id:18s} | {r.name:22s} | {r.category:8s} | {v:3s} {ma:6s} | "
+            f"{midi:12s} | {stereo:6s} | {top:6s} | {bp:10s} | width {w}"
+        )
 
 
 def power_check(records: List[PedalRecord], pedal_id: str, supply_ma: int = 100, voltage_v: float = 9.0) -> None:
@@ -63,10 +67,7 @@ def parse_question(q: str) -> dict:
     # category hints
     for cat in ["reverb", "delay", "drive", "tuner", "looper", "utility", "modulation", "multi"]:
         if cat in ql:
-            if cat == "multi":
-                c["category"] = "multi_fx"
-            else:
-                c["category"] = cat
+            c["category"] = "multi_fx" if cat == "multi" else cat
             break
 
     # booleans
@@ -111,7 +112,6 @@ def parse_question(q: str) -> dict:
 
     mma = re.search(r"\b(\d{2,4})\s*ma\b", ql)
     if mma:
-        # interpret as max current unless question suggests otherwise
         if re.search(r"\bunder\b|\b<=\b|\bless\b|\bmax\b", ql):
             c["max_current_ma"] = int(mma.group(1))
 
@@ -184,6 +184,7 @@ def filter_midi_stereo_9v(records: List[PedalRecord]) -> List[PedalRecord]:
         out.append(r)
     return out
 
+
 def filter_reverbs_expression_width(records: List[PedalRecord], max_width_mm: float = 125.0) -> List[PedalRecord]:
     out: List[PedalRecord] = []
     for r in records:
@@ -202,29 +203,50 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--records", default="out/pedals.jsonl")
     ap.add_argument("--power_pedal_id", default="nexus_multi_fx", help="Pedal id for power demo")
-    ap.add_argument("--question", default=None, help='Natural language question, e.g. "reverbs with expression under 125mm"')
-    args = ap.parse_args()
 
+    ap.add_argument("--question", default=None, help='Natural language question, e.g. "reverbs with expression under 125mm"')
+
+    # LLM narration (Ollama)
+    ap.add_argument("--ollama", action="store_true", help="Use Ollama to narrate results (filtering remains deterministic)")
+    ap.add_argument("--model", default="llama3.2:3b", help="Ollama model name, e.g. llama3.2:3b or llama3.1:8b")
+    ap.add_argument("--ollama_url", default="http://127.0.0.1:11434", help="Ollama base URL")
+
+    args = ap.parse_args()
     records = load_records(args.records)
 
     if args.question:
         c = parse_question(args.question)
         results = apply_constraints(records, c)
+
+        # Always print shortlist (useful even if LLM fails)
         print_shortlist(f'Question: "{args.question}"', results)
+
+        if args.ollama:
+            print("\n=== LLM narration (Ollama) ===")
+            try:
+                answer = ollama_narrate(
+                    args.question,
+                    results,
+                    model=args.model,
+                    base_url=args.ollama_url,
+                )
+                print(answer)
+            except Exception as e:
+                print(f"[ollama] error: {e}")
+
         return 0
 
-    # Demo 1
+    # Default demo mode
     power_check(records, args.power_pedal_id, supply_ma=100, voltage_v=9.0)
 
-    # Demo 2
     shortlist = filter_midi_stereo_9v(records)
     print_shortlist("MIDI + stereo out + 9V", shortlist)
 
-    # Demo 3
     shortlist2 = filter_reverbs_expression_width(records, max_width_mm=125.0)
     print_shortlist("Reverbs + expression + width<=125mm", shortlist2)
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
