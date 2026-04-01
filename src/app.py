@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import requests
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 
@@ -186,25 +187,37 @@ def build_structured_context(selected: List[PedalRecord], preferences: str = "",
     return "\n".join(lines)
 
 
-def build_raw_context(user_prompt: str, selected: List[PedalRecord]) -> str:
-    lines: List[str] = [user_prompt.strip()]
+def load_raw_note_text(pedal_id: str, data_dir: str = "data/pedals") -> str:
+    """
+    Loads the raw note text from data/pedals/{id}.txt
+    """
+    p = Path(data_dir) / f"{pedal_id}.txt"
+    if not p.exists():
+        return f"(raw note not found: {p})"
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def build_raw_context(user_prompt: str, selected: List[PedalRecord], excerpt_chars: int = 900) -> str:
+    """
+    TRUE 'raw' baseline:
+    - includes the user prompt
+    - includes raw note excerpts (not extracted fields)
+    """
+    lines: List[str] = []
+    lines.append("User prompt:")
+    lines.append(user_prompt.strip())
+
     if selected:
         lines.append("")
-        lines.append("Reference notes:")
+        lines.append("Raw pedal notes (excerpts):")
         for r in selected:
-            note_bits: List[str] = []
-            if r.category:
-                note_bits.append(r.category)
-            if r.power.current_ma is not None:
-                note_bits.append(f"{r.power.current_ma}mA")
-            if r.io.stereo_out:
-                note_bits.append("stereo out")
-            if r.control.expression:
-                note_bits.append("expression")
-            if r.control.midi:
-                note_bits.append("MIDI")
-            suffix = f" ({', '.join(note_bits)})" if note_bits else ""
-            lines.append(f"- {r.name}{suffix}")
+            raw = load_raw_note_text(r.id)
+            raw_clean = " ".join(raw.split())
+            excerpt = raw_clean[:excerpt_chars] + ("…" if len(raw_clean) > excerpt_chars else "")
+            lines.append("")
+            lines.append(f"--- {r.name} (id: {r.id}) ---")
+            lines.append(excerpt)
+
     return "\n".join(lines)
 
 
@@ -213,12 +226,60 @@ def build_raw_context(user_prompt: str, selected: List[PedalRecord]) -> str:
 # ---------------------------
 
 def ollama_controls(scope_key: str) -> Dict[str, object]:
-    with st.expander("LLM narration (Ollama)", expanded=False):
-        use_llm = st.checkbox("Use Ollama to narrate", value=True, key=f"{scope_key}_use_ollama")
+    with st.expander("LLM settings (Ollama)", expanded=False):
+        use_llm = st.checkbox("Run Ollama comparison", value=True, key=f"{scope_key}_use_ollama")
         model = st.text_input("Ollama model", value="llama3.2:3b", key=f"{scope_key}_ollama_model")
         base_url = st.text_input("Ollama base URL", value="http://127.0.0.1:11434", key=f"{scope_key}_ollama_url")
-        st.caption("Ollama is used as a narrator. Specs are constrained by extracted fields + snippets.")
+        st.caption("Raw side uses a naive prompt over raw text. Structured side uses grounded narration + snippet citations.")
     return {"use_llm": use_llm, "model": model, "base_url": base_url}
+
+
+def ollama_naive_answer(
+    *,
+    model: str,
+    base_url: str,
+    user_prompt: str,
+    raw_context: str,
+    timeout_s: int = 60,
+) -> str:
+    """
+    Naive baseline:
+    - sends raw prompt + raw note excerpts
+    - does NOT include extracted fields or snippet keys
+    """
+    system = (
+        "You are a helpful guitar pedalboard assistant.\n"
+        "You will be given a user prompt and raw pedal notes.\n"
+        "Make a reasonable recommendation for a signal chain and explain why.\n"
+        "If information is missing, you may make best-effort assumptions, but be clear when you are assuming.\n"
+    )
+
+    user = (
+        f"{raw_context}\n\n"
+        "Task:\n"
+        "- Recommend a coherent signal chain.\n"
+        "- Explain the reasoning.\n"
+        "- Call out any assumptions.\n"
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.4, "num_ctx": 4096},
+    }
+
+    url = f"{base_url.rstrip('/')}/api/chat"
+    r = requests.post(url, json=payload, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json()
+    content = (data.get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        return "LLM returned an empty response."
+    return content.strip()
 
 
 # ---------------------------
@@ -286,7 +347,6 @@ _SOUND_STOPWORDS = {
     "keep", "make", "get",
 }
 
-# Spec-ish tokens we don't want diluting vibe search (power + routing + flags)
 _SPEC_STOPWORDS = {
     "midi", "stereo", "mono", "in", "out", "input", "output",
     "expression", "exp", "tap", "tempo",
@@ -296,30 +356,19 @@ _SPEC_STOPWORDS = {
     "under", "max", "<=", ">=", "less", "more",
     "v", "vdc", "volt", "volts", "ma", "mm", "cm", "inch", "inches",
     "power", "isolated", "supply", "supplies", "cioks",
-    # keep these in constraints, not in the vibe vector
     "tuner", "utility", "modulation", "multi", "fx", "effects",
 }
 
 def split_merge_query(merged: str) -> Tuple[str, dict]:
-    """
-    Returns (sound_query, parsed_constraints).
-
-    - parsed_constraints uses parse_question() (deterministic)
-    - sound_query is cleaned for embeddings: remove filler + spec chatter
-    """
     merged = merged.strip()
     parsed = parse_question(merged)
 
     lower = merged.lower()
 
-    # remove common filler phrases
     for pat in _FILLER_PHRASES:
         lower = re.sub(pat, " ", lower)
 
-    # remove numeric constraints (9v, 500ma, 125mm, etc.)
     lower = re.sub(r"\b\d+(\.\d+)?\s*(v|vdc|ma|mm|cm|in|inch|inches)\b", " ", lower)
-
-    # remove punctuation but keep hyphens for "tape-ish"
     lower = re.sub(r"[^\w\s-]", " ", lower)
 
     tokens = [t for t in lower.split() if t.strip()]
@@ -335,8 +384,6 @@ def split_merge_query(merged: str) -> Tuple[str, dict]:
         kept.append(t)
 
     sound_query = " ".join(kept).strip()
-
-    # If we stripped too much, fallback to original (better than empty)
     if not sound_query:
         sound_query = merged
 
@@ -344,11 +391,6 @@ def split_merge_query(merged: str) -> Tuple[str, dict]:
 
 
 def pick_fallback_pedals(records: List[PedalRecord], prompt: str, k: int) -> List[PedalRecord]:
-    """
-    If embeddings are missing, pick a reasonable default set:
-    - Start with a few known demo pedals if present
-    - Then fill by category hints in the prompt
-    """
     by_id = {r.id: r for r in records}
     defaults = [pid for pid in ["grit_drive", "canyon_delay", "cloudburst_reverb", "nexus_multi_fx"] if pid in by_id]
     picked: List[PedalRecord] = [by_id[pid] for pid in defaults][:k]
@@ -361,10 +403,6 @@ def pick_fallback_pedals(records: List[PedalRecord], prompt: str, k: int) -> Lis
         cat_order.append("delay")
     if "drive" in want or "distort" in want or "gain" in want:
         cat_order.append("drive")
-    if "looper" in want or "loop" in want:
-        cat_order.append("looper")
-    if "tuner" in want:
-        cat_order.append("tuner")
 
     for cat in cat_order:
         for r in records:
@@ -375,7 +413,6 @@ def pick_fallback_pedals(records: List[PedalRecord], prompt: str, k: int) -> Lis
             if r.category == cat:
                 picked.append(r)
 
-    # fill anything
     for r in records:
         if len(picked) >= k:
             break
@@ -393,20 +430,15 @@ def auto_select_pedals(
     top_k: int,
     apply_constraints_first: bool,
 ) -> Tuple[List[PedalRecord], Dict, str, List[Tuple[str, float]]]:
-    """
-    Returns: (selected_records, parsed_constraints, sound_query, scored_ids)
-    """
     constraints = parse_question(user_prompt)
     sound_q, _ = split_merge_query(user_prompt)
     sound_query = sound_q if sound_q else user_prompt.strip()
 
-    # candidate set after deterministic constraints (optional)
     allowed_ids: Optional[List[str]] = None
     if apply_constraints_first and constraints:
         filtered = apply_constraints(records, constraints)
         allowed_ids = [r.id for r in filtered]
 
-    # embeddings path
     p = Path(index_path)
     if p.exists():
         ids, embs = load_embeddings(index_path)
@@ -415,9 +447,10 @@ def auto_select_pedals(
             ids=ids,
             embs=embs,
             model_name=embed_model,
-            top_k=max(top_k, 8),  # search a bit wider, then trim to those present in records
+            top_k=max(top_k, 10),
             allowed_ids=allowed_ids,
         )
+
         by_id = {r.id: r for r in records}
         chosen: List[PedalRecord] = []
         for pid, _score in scored:
@@ -425,8 +458,8 @@ def auto_select_pedals(
                 chosen.append(by_id[pid])
             if len(chosen) >= top_k:
                 break
+
         if not chosen:
-            # if constraints wiped it out, fallback within constraints or overall
             chosen = pick_fallback_pedals(
                 apply_constraints(records, constraints) if constraints else records,
                 user_prompt,
@@ -434,7 +467,6 @@ def auto_select_pedals(
             )
         return chosen, constraints, sound_query, scored
 
-    # no embeddings: fallback
     chosen = pick_fallback_pedals(
         apply_constraints(records, constraints) if constraints else records,
         user_prompt,
@@ -453,7 +485,7 @@ records = cached_records(records_path)
 
 tabs = st.tabs(
     [
-        "Demo: One-Prompt (Raw vs Structured)",
+        "Demo: One-Prompt (Comparison)",
         "Constraint Finder",
         "Vibe Search (Embeddings)",
         "Board Builder",
@@ -462,11 +494,11 @@ tabs = st.tabs(
 )
 
 # -------------------------------------------------------------------
-# TAB 0: HERO DEMO (one prompt)
+# TAB 0: HERO DEMO (real comparison)
 # -------------------------------------------------------------------
 with tabs[0]:
-    st.subheader("Demo: One-Prompt (Raw vs Structured)")
-    st.caption("Type one natural-language prompt. The app auto-selects pedals, builds Raw vs Structured context, and optionally runs Ollama.")
+    st.subheader("Demo: One-Prompt (Comparison)")
+    st.caption("This is a real baseline vs structured test: raw notes + naive LLM vs extracted fields + grounded narration.")
 
     user_prompt = st.text_area(
         "Your prompt",
@@ -486,9 +518,10 @@ with tabs[0]:
             help="If enabled: deterministic filters narrow candidates, then embeddings rank only within that set.",
         )
         show_explain = st.checkbox("Show elimination explain table", value=False, key="one_prompt_explain")
+        raw_excerpt_chars = st.slider("Raw note excerpt length", 300, 2000, 900, 100, key="raw_excerpt_chars")
 
     llm_cfg = ollama_controls("one_prompt_llm")
-    run = st.button("Run demo", key="one_prompt_run")
+    run = st.button("Run comparison", key="one_prompt_run")
 
     if run:
         index_path = st.session_state.get("one_prompt_index", "out/embeddings.npz")
@@ -496,6 +529,7 @@ with tabs[0]:
         top_k = int(st.session_state.get("one_prompt_topk", 5))
         apply_constraints_first = bool(st.session_state.get("one_prompt_apply_constraints_first", True))
         show_explain = bool(st.session_state.get("one_prompt_explain", False))
+        raw_excerpt_chars = int(st.session_state.get("raw_excerpt_chars", 900))
 
         selected, constraints, sound_query, scored = auto_select_pedals(
             records,
@@ -510,7 +544,6 @@ with tabs[0]:
         st.write(f"- Parsed constraints: `{constraints}`")
         st.write(f"- Sound query used for embeddings: **{sound_query}**")
         if scored:
-            st.write("- Embedding top hits (id, score):")
             preview = [{"id": pid, "score": round(score, 4)} for pid, score in scored[:10]]
             st.dataframe(preview, use_container_width=True)
         else:
@@ -528,8 +561,6 @@ with tabs[0]:
                 st.metric("Total", len(records))
             if eliminated_rows:
                 st.dataframe(eliminated_rows, use_container_width=True)
-            else:
-                st.caption("Nothing eliminated by constraints.")
 
         st.markdown("### Auto-selected pedals")
         st.dataframe([record_row(r) for r in selected], use_container_width=True)
@@ -537,52 +568,49 @@ with tabs[0]:
         preferences_text = sound_query
         constraints_text = ", ".join([f"{k}={v}" for k, v in constraints.items()]) if constraints else ""
 
-        raw_context = build_raw_context(user_prompt, selected)
+        raw_context = build_raw_context(user_prompt, selected, excerpt_chars=raw_excerpt_chars)
         structured_context = build_structured_context(selected, preferences_text, constraints_text)
 
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### Raw context")
+            st.markdown("### Raw context (true baseline)")
             st.code(raw_context, language="text")
         with c2:
-            st.markdown("### Structured context")
+            st.markdown("### Structured context (extracted)")
             st.code(structured_context, language="text")
 
         if llm_cfg["use_llm"]:
-            st.markdown("### Ollama outputs (Raw vs Structured)")
-            q_llm = (
-                "Recommend a coherent signal chain and explain the reasoning. "
-                "If something is unknown, say so—do not invent specs."
-            )
-
+            st.markdown("### Ollama outputs (Naive vs Grounded)")
             o1, o2 = st.columns(2)
+
             with o1:
-                with st.spinner("Asking Ollama (raw)..."):
+                with st.spinner("Asking Ollama (naive, raw notes)..."):
                     try:
-                        ans_raw = ollama_narrate(
-                            question=q_llm + "\n\n" + raw_context,
-                            matches=selected,
+                        ans_raw = ollama_naive_answer(
                             model=str(llm_cfg["model"]),
                             base_url=str(llm_cfg["base_url"]),
+                            user_prompt=user_prompt,
+                            raw_context=raw_context,
                         )
-                        st.markdown("#### Raw → Ollama")
+                        st.markdown("#### Naive (raw notes) → Ollama")
                         st.write(ans_raw)
                     except Exception as e:
-                        st.error(f"Ollama error (raw): {e}")
+                        st.error(f"Ollama error (naive/raw): {e}")
 
             with o2:
-                with st.spinner("Asking Ollama (structured)..."):
+                with st.spinner("Asking Ollama (grounded, extracted fields)..."):
                     try:
+                        # Grounded narration uses extracted facts + snippet citations
                         ans_struct = ollama_narrate(
-                            question=q_llm + "\n\n" + structured_context,
+                            question="Recommend a coherent signal chain and explain the reasoning.\n\n" + structured_context,
                             matches=selected,
                             model=str(llm_cfg["model"]),
                             base_url=str(llm_cfg["base_url"]),
                         )
-                        st.markdown("#### Structured → Ollama")
+                        st.markdown("#### Grounded (structured) → Ollama")
                         st.write(ans_struct)
                     except Exception as e:
-                        st.error(f"Ollama error (structured): {e}")
+                        st.error(f"Ollama error (grounded/structured): {e}")
 
         st.markdown("### Inspect sources")
         if selected:
@@ -633,7 +661,7 @@ with tabs[1]:
             st.info("No matches. Try relaxing one constraint.")
 
         if llm_cfg["use_llm"]:
-            st.markdown("### LLM narration")
+            st.markdown("### LLM narration (grounded)")
             with st.spinner("Asking Ollama..."):
                 ans = ollama_narrate(
                     question=q,
