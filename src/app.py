@@ -48,7 +48,7 @@ def normalize_vec(v: np.ndarray) -> np.ndarray:
 # Display helpers
 # ---------------------------
 
-def record_row(r: PedalRecord) -> Dict:
+def record_row(r: PedalRecord) -> Dict[str, object]:
     return {
         "id": r.id,
         "name": r.name,
@@ -70,7 +70,7 @@ def record_row(r: PedalRecord) -> Dict:
     }
 
 
-def show_sources(r: PedalRecord):
+def show_sources(r: PedalRecord) -> None:
     st.markdown("**Sources (snippets)**")
     if not r.sources:
         st.caption("No snippets captured.")
@@ -79,8 +79,8 @@ def show_sources(r: PedalRecord):
         st.write(f"- `{k}`: {r.sources[k]}")
 
 
-def build_elimination_rows(records: List[PedalRecord], constraints: dict) -> List[Dict]:
-    rows: List[Dict] = []
+def build_elimination_rows(records: List[PedalRecord], constraints: dict) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
     for r in records:
         ev = evaluate_constraints(r, constraints)
         if ev.passed:
@@ -615,8 +615,9 @@ with tabs[0]:
         st.markdown("### Inspect sources")
         if selected:
             pick_src = st.selectbox("Pick a pedal", options=[r.id for r in selected], key="one_prompt_pick_sources")
-            rr = next(r for r in selected if r.id == pick_src)
-            show_sources(rr)
+            if pick_src is not None:
+                rr = next(r for r in selected if r.id == pick_src)
+                show_sources(rr)
 
 # -------------------------------------------------------------------
 # TAB 1: Constraint Finder
@@ -655,8 +656,9 @@ with tabs[1]:
         if results:
             st.dataframe([record_row(r) for r in results], use_container_width=True)
             pick = st.selectbox("Pick a result", options=[r.id for r in results], key="constraint_pick")
-            rr = next(r for r in results if r.id == pick)
-            show_sources(rr)
+            if pick is not None:
+                rr = next(r for r in results if r.id == pick)
+                show_sources(rr)
         else:
             st.info("No matches. Try relaxing one constraint.")
 
@@ -729,7 +731,7 @@ with tabs[2]:
                 st.info("No results.")
             else:
                 by_id = {r.id: r for r in records}
-                rows: List[Dict] = []
+                rows: List[Dict[str, object]] = []
                 for pid, score in results:
                     r = by_id.get(pid)
                     if not r:
@@ -737,9 +739,13 @@ with tabs[2]:
                     row = record_row(r)
                     row["score"] = round(score, 4)
                     rows.append(row)
+
                 st.dataframe(rows, use_container_width=True)
-                pick = st.selectbox("Inspect sources", options=[r["id"] for r in rows], key="vibe_pick")
-                show_sources(by_id[pick])
+
+                row_ids = [str(r["id"]) for r in rows]
+                pick = st.selectbox("Inspect sources", options=row_ids, key="vibe_pick")
+                if pick is not None:
+                    show_sources(by_id[pick])
 
 # -------------------------------------------------------------------
 # TAB 3: Board Builder
@@ -774,8 +780,9 @@ with tabs[3]:
     if selected:
         st.dataframe([record_row(r) for r in selected], use_container_width=True)
         pick = st.selectbox("Inspect sources", options=[r.id for r in selected], key="board_pick")
-        rr = next(r for r in selected if r.id == pick)
-        show_sources(rr)
+        if pick is not None:
+            rr = next(r for r in selected if r.id == pick)
+            show_sources(rr)
 
 # -------------------------------------------------------------------
 # TAB 4: Browse Data
@@ -785,5 +792,6 @@ with tabs[4]:
     st.dataframe([record_row(r) for r in records], use_container_width=True)
 
     pick = st.selectbox("Inspect sources", options=[r.id for r in records], key="browse_pick")
-    rr = next(r for r in records if r.id == pick)
-    show_sources(rr)
+    if pick is not None:
+        rr = next(r for r in records if r.id == pick)
+        show_sources(rr)
