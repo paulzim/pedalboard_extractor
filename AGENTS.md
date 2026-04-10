@@ -209,6 +209,24 @@ Less useful requests are broad prompts like:
 
 ---
 
+## Commit message guidance
+After making a change, always suggest:
+- one concise commit message
+- one slightly more descriptive alternative if helpful
+
+Commit messages should:
+- describe the user-visible fix or code change
+- match the actual scope of the diff
+- avoid vague wording like "update" or "cleanup" unless truly appropriate
+
+## Response style for code changes
+When fixing bugs:
+- explain root cause briefly
+- keep the diff narrow
+- call out any demo-facing impact
+
+---
+
 ## Short repo summary
 Use this mental model when working here:
 

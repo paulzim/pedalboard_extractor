@@ -97,20 +97,51 @@ def build_elimination_rows(records: List[PedalRecord], constraints: dict) -> Lis
     return rows
 
 
-def strip_snippets_used_section(text: str) -> str:
+def _is_snippets_used_heading(line: str) -> bool:
+    stripped = line.strip()
+    stripped = re.sub(r"^#{1,6}\s*", "", stripped).strip()
+    stripped = stripped.strip("*").strip()
+    stripped = stripped.rstrip(":").strip()
+    return stripped.lower() == "snippets used"
+
+
+def _is_standalone_citation_key_line(line: str) -> bool:
+    candidate = line.strip()
+    candidate = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", candidate).strip()
+    candidate = candidate.strip("`").strip()
+    candidate = candidate.rstrip(".,;:").strip()
+    if candidate.startswith("(") and candidate.endswith(")"):
+        candidate = candidate[1:-1].strip()
+    candidate = candidate.strip("`").strip()
+    candidate = candidate.rstrip(".,;:").strip()
+
+    return re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+",
+        candidate,
+    ) is not None
+
+
+def clean_grounded_llm_output(text: str) -> str:
     """
     Presentation-friendly cleanup for grounded LLM output.
 
-    Removes the trailing '## Snippets used' section so the audience sees
-    a cleaner answer in the side-by-side comparison. Provenance is still
-    available in the app via 'Inspect sources'.
+    Removes:
+    - trailing 'Snippets used' section, even if the model varies markdown
+    - standalone citation-key / dotted field-path lines like:
+      power.current_ma
+      io.stereo_out
+      control.expression
     """
-    cleaned = re.sub(
-        r"\n##\s*Snippets used[\s\S]*$",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
+    kept_lines: List[str] = []
+    for line in text.splitlines():
+        if _is_snippets_used_heading(line):
+            break
+        if _is_standalone_citation_key_line(line):
+            continue
+        kept_lines.append(line)
+
+    cleaned = "\n".join(kept_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
 
@@ -623,7 +654,7 @@ with tabs[0]:
                             model=str(llm_cfg["model"]),
                             base_url=str(llm_cfg["base_url"]),
                         )
-                        ans_struct_clean = strip_snippets_used_section(ans_struct)
+                        ans_struct_clean = clean_grounded_llm_output(ans_struct)
                         st.markdown("#### Grounded (structured) → Ollama")
                         st.write(ans_struct_clean)
                     except Exception as e:
@@ -688,7 +719,7 @@ with tabs[1]:
                     model=str(llm_cfg["model"]),
                     base_url=str(llm_cfg["base_url"]),
                 )
-                ans_clean = strip_snippets_used_section(ans)
+                ans_clean = clean_grounded_llm_output(ans)
                 st.write(ans_clean)
 
 # -------------------------------------------------------------------
