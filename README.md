@@ -69,6 +69,13 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+### Run tests
+```bash
+python -m pytest
+```
+
+The tests are intentionally small and deterministic: constraint parsing/filtering, unit normalization, and one focused extraction pass over a temporary pedal note.
+
 ### Extract records
 ```bash
 python -m src.extract --data_dir data/pedals --out_dir out
