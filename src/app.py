@@ -97,6 +97,23 @@ def build_elimination_rows(records: List[PedalRecord], constraints: dict) -> Lis
     return rows
 
 
+def strip_snippets_used_section(text: str) -> str:
+    """
+    Presentation-friendly cleanup for grounded LLM output.
+
+    Removes the trailing '## Snippets used' section so the audience sees
+    a cleaner answer in the side-by-side comparison. Provenance is still
+    available in the app via 'Inspect sources'.
+    """
+    cleaned = re.sub(
+        r"\n##\s*Snippets used[\s\S]*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned
+
+
 # ---------------------------
 # Context builders (raw vs structured)
 # ---------------------------
@@ -600,15 +617,15 @@ with tabs[0]:
             with o2:
                 with st.spinner("Asking Ollama (grounded, extracted fields)..."):
                     try:
-                        # Grounded narration uses extracted facts + snippet citations
                         ans_struct = ollama_narrate(
                             question="Recommend a coherent signal chain and explain the reasoning.\n\n" + structured_context,
                             matches=selected,
                             model=str(llm_cfg["model"]),
                             base_url=str(llm_cfg["base_url"]),
                         )
+                        ans_struct_clean = strip_snippets_used_section(ans_struct)
                         st.markdown("#### Grounded (structured) → Ollama")
-                        st.write(ans_struct)
+                        st.write(ans_struct_clean)
                     except Exception as e:
                         st.error(f"Ollama error (grounded/structured): {e}")
 
@@ -671,7 +688,8 @@ with tabs[1]:
                     model=str(llm_cfg["model"]),
                     base_url=str(llm_cfg["base_url"]),
                 )
-                st.write(ans)
+                ans_clean = strip_snippets_used_section(ans)
+                st.write(ans_clean)
 
 # -------------------------------------------------------------------
 # TAB 2: Vibe Search (Embeddings)
