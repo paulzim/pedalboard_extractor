@@ -101,6 +101,7 @@ def _is_snippets_used_heading(line: str) -> bool:
     stripped = line.strip()
     stripped = re.sub(r"^#{1,6}\s*", "", stripped).strip()
     stripped = stripped.strip("*").strip()
+    stripped = re.sub(r"^\d+[.)]\s*", "", stripped).strip()
     stripped = stripped.rstrip(":").strip()
     return stripped.lower() == "snippets used"
 
