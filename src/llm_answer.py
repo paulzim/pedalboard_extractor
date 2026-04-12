@@ -122,42 +122,49 @@ def _looks_inconsistent(text: str, match_count: int) -> bool:
         return True
 
     recommended_section = re.search(
-        r"##\s*(?:1\.\s*)?recommended chain([\s\S]*?)(##\s*(?:2\.\s*)?why this order works|##\s*(?:3\.\s*)?notes\s*/\s*constraints|##\s*(?:\d+[.)]\s*)?snippets|$)",
+        r"##\s*(?:1\.\s*)?recommended chain([\s\S]*?)(##\s*(?:2\.\s*)?why this fits|##\s*(?:3\.\s*)?constraints honored|##\s*(?:4\.\s*)?unknowns\s*/\s*tradeoffs|##\s*(?:\d+[.)]\s*)?snippets|$)",
         text,
         re.IGNORECASE,
     )
-    why_section = re.search(
-        r"##\s*(?:2\.\s*)?why this order works([\s\S]*?)(##\s*(?:3\.\s*)?notes\s*/\s*constraints|##\s*(?:\d+[.)]\s*)?snippets|$)",
+    fit_section = re.search(
+        r"##\s*(?:2\.\s*)?why this fits([\s\S]*?)(##\s*(?:3\.\s*)?constraints honored|##\s*(?:4\.\s*)?unknowns\s*/\s*tradeoffs|##\s*(?:\d+[.)]\s*)?snippets|$)",
         text,
         re.IGNORECASE,
     )
-    notes_section = re.search(
-        r"##\s*(?:3\.\s*)?notes\s*/\s*constraints([\s\S]*?)(##\s*(?:\d+[.)]\s*)?snippets|$)",
+    constraints_section = re.search(
+        r"##\s*(?:3\.\s*)?constraints honored([\s\S]*?)(##\s*(?:4\.\s*)?unknowns\s*/\s*tradeoffs|##\s*(?:\d+[.)]\s*)?snippets|$)",
+        text,
+        re.IGNORECASE,
+    )
+    unknowns_section = re.search(
+        r"##\s*(?:4\.\s*)?unknowns\s*/\s*tradeoffs([\s\S]*?)(##\s*(?:\d+[.)]\s*)?snippets|$)",
         text,
         re.IGNORECASE,
     )
 
-    if not recommended_section or not why_section or not notes_section:
+    if not recommended_section or not fit_section or not constraints_section or not unknowns_section:
         return True
 
     recommended_text = recommended_section.group(1)
-    why_text = why_section.group(1)
-    notes_text = notes_section.group(1)
+    fit_text = fit_section.group(1)
+    constraints_text = constraints_section.group(1)
+    unknowns_text = unknowns_section.group(1)
     has_recommended_bullet = bool(re.search(r"^\s*-\s+", recommended_text, re.MULTILINE))
     has_non_none_chain = bool(
         re.search(r"^\s*-\s+(?!\(none\)\s*$).+", recommended_text, re.MULTILINE | re.IGNORECASE)
     )
-    has_why_bullet = bool(
-        re.search(r"^\s*-\s+(?!\(none\)\s*$).+", why_text, re.MULTILINE | re.IGNORECASE)
+    has_fit_bullet = bool(
+        re.search(r"^\s*-\s+(?!\(none\)\s*$).+", fit_text, re.MULTILINE | re.IGNORECASE)
     )
-    has_notes_bullet = bool(re.search(r"^\s*-\s+", notes_text, re.MULTILINE))
+    has_constraints_bullet = bool(re.search(r"^\s*-\s+", constraints_text, re.MULTILINE))
+    has_unknowns_bullet = bool(re.search(r"^\s*-\s+", unknowns_text, re.MULTILINE))
 
-    if not has_recommended_bullet or not has_notes_bullet:
+    if not has_recommended_bullet or not has_constraints_bullet or not has_unknowns_bullet:
         return True
     if match_count == 0 and has_non_none_chain:
         return True
     if match_count > 0:
-        if not has_non_none_chain or not has_why_bullet:
+        if not has_non_none_chain or not has_fit_bullet:
             return True
     return False
 
@@ -184,26 +191,32 @@ def ollama_narrate(
         "3) If a detail is unknown/missing, explicitly say 'unknown' and do not guess.\n"
         "4) When you mention a spec, include a citation key in parentheses like (power.current_ma).\n"
         "5) You may use ordinary signal-chain reasoning to choose pedal order, but roles must come from the provided category/facts and the user's request.\n"
-        f"6) Only cite keys from this allowlist: {allowed_keys}\n"
-        "7) Output MUST be concise markdown with EXACT headings:\n"
+        "6) Prefer chain-level reasoning over per-pedal summaries. Make the value of structured context obvious: explicit requirements honored, explicit unknowns, and reduced guesswork.\n"
+        f"7) Only cite keys from this allowlist: {allowed_keys}\n"
+        "8) Output MUST be concise markdown with EXACT headings:\n"
         "   ## 1. Recommended chain\n"
-        "   ## 2. Why this order works\n"
-        "   ## 3. Notes / constraints\n"
+        "   ## 2. Why this fits\n"
+        "   ## 3. Constraints honored\n"
+        "   ## 4. Unknowns / tradeoffs\n"
         "   ## Snippets used\n"
-        "8) In 'Recommended chain', provide one bullet with matched pedal names in recommended order, separated by ' -> '. If no matches, use '- (none)'.\n"
-        "9) In 'Why this order works', use 1-2 bullets tied to the requested tone and provided categories/facts.\n"
-        "10) In 'Notes / constraints', use 1-3 bullets for power, stereo, MIDI, unknowns, or tradeoffs. Cite any spec mentioned.\n"
-        "11) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
-        "12) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
+        "9) In 'Recommended chain', provide one bullet with matched pedal names in recommended order, separated by ' -> '. If no matches, use '- (none)'.\n"
+        "10) In 'Why this fits', use 1-2 bullets tied to the requested tone and the selected chain.\n"
+        "11) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
+        "12) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
+        "13) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
+        "14) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
+        "15) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
     )
 
     template = (
         "## 1. Recommended chain\n"
         "- <Pedal A> -> <Pedal B> -> <Pedal C>\n\n"
-        "## 2. Why this order works\n"
+        "## 2. Why this fits\n"
         "- <brief explanation tied to the requested tone and provided facts>\n\n"
-        "## 3. Notes / constraints\n"
-        "- <power, stereo, MIDI, unknowns, or tradeoffs; cite any specs mentioned>\n\n"
+        "## 3. Constraints honored\n"
+        "- <explicit requirement or capability supported by provided facts; cite any specs mentioned>\n\n"
+        "## 4. Unknowns / tradeoffs\n"
+        "- <missing value, limitation, or tradeoff; cite any specs mentioned>\n\n"
         "## Snippets used\n"
         "- <keys cited above>\n"
     )
@@ -216,12 +229,14 @@ def ollama_narrate(
         "Write the final answer following the rules exactly.\n"
         "If MATCH_COUNT is 0:\n"
         "- Recommended chain section must contain exactly one bullet: '- (none)'.\n"
-        "- Why this order works must say no chain can be recommended because MATCH_COUNT is 0.\n"
-        "- Notes / constraints must briefly say no matching pedals were available.\n"
+        "- Why this fits must say no chain can be recommended because MATCH_COUNT is 0.\n"
+        "- Constraints honored must say none could be confirmed because there were no matching pedals.\n"
+        "- Unknowns / tradeoffs must briefly say no matching pedals were available.\n"
         "If MATCH_COUNT is >0:\n"
         "- Recommended chain section must recommend an order using matched pedal names only.\n"
-        "- Why this order works must explain how that order supports the requested tone.\n"
-        "- Notes / constraints must mention relevant power, stereo, MIDI, unknowns, or tradeoffs from the provided facts.\n\n"
+        "- Why this fits must explain how that order supports the requested tone.\n"
+        "- Constraints honored must clearly surface explicit requirements that the chain satisfies, such as power, stereo, MIDI, or other parsed constraints, but only when they are supported by provided facts.\n"
+        "- Unknowns / tradeoffs must clearly surface missing values, limitations, or compromises instead of hiding them.\n\n"
         f"Template:\n{template}"
     )
 
@@ -243,8 +258,9 @@ def ollama_narrate(
             "Hard requirements:\n"
             f"- MATCH_COUNT is {match_count}; your chain guidance MUST match it.\n"
             "- Do not say 'no matches' if MATCH_COUNT > 0.\n"
-            "- Include exactly these visible sections: Recommended chain, Why this order works, Notes / constraints.\n"
+            "- Include exactly these visible sections: Recommended chain, Why this fits, Constraints honored, Unknowns / tradeoffs.\n"
             "- Use matched pedal names only in the recommended chain.\n"
+            "- Make constraints honored and unknowns / tradeoffs explicit.\n"
             "- Explain the order without inventing specs.\n"
             "- Use correct citation formatting: (key) with keys from allowlist only.\n"
         )
