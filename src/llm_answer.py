@@ -26,6 +26,8 @@ CITABLE_KEYS: List[str] = [
     "size_mm.depth",
 ]
 
+_CORE_EFFECT_CATEGORIES = {"drive", "delay", "reverb"}
+
 
 def _short_snip(s: str, limit: int = 140) -> str:
     s = " ".join(s.split())
@@ -143,7 +145,41 @@ def _extract_recommended_chain_items(text: str) -> List[str]:
     return items
 
 
-def _looks_inconsistent(text: str, match_count: int, candidate_names: List[str]) -> bool:
+def _names_appear_in_order(text: str, names: List[str]) -> bool:
+    lower = text.lower()
+    pos = -1
+    for name in names:
+        idx = lower.find(name.lower(), pos + 1)
+        if idx < 0:
+            return False
+        pos = idx
+    return True
+
+
+def _duplicate_core_categories(chain_items: List[str], name_to_category: Dict[str, str]) -> Set[str]:
+    counts: Dict[str, int] = {}
+    for item in chain_items:
+        category = name_to_category.get(item)
+        if category in _CORE_EFFECT_CATEGORIES:
+            counts[category] = counts.get(category, 0) + 1
+    return {category for category, count in counts.items() if count > 1}
+
+
+def _fit_explicitly_justifies_stacking(fit_text: str, duplicate_categories: Set[str]) -> bool:
+    lower = fit_text.lower()
+    if not duplicate_categories:
+        return True
+    if not any(word in lower for word in ("stack", "stacking", "layer", "layering")):
+        return False
+    return any(category in lower for category in duplicate_categories)
+
+
+def _looks_inconsistent(
+    text: str,
+    match_count: int,
+    candidate_names: List[str],
+    name_to_category: Dict[str, str],
+) -> bool:
     """
     Heuristic: catch obvious format misses so small local models get one
     retry with stricter instructions.
@@ -203,6 +239,10 @@ def _looks_inconsistent(text: str, match_count: int, candidate_names: List[str])
             return True
         if len(set(chain_items)) != len(chain_items):
             return True
+        if not _names_appear_in_order(fit_text, chain_items):
+            return True
+        if not _fit_explicitly_justifies_stacking(fit_text, _duplicate_core_categories(chain_items, name_to_category)):
+            return True
     return False
 
 
@@ -217,6 +257,7 @@ def ollama_narrate(
     match_count = len(matches)
     match_ids = [m.id for m in matches[:10]]  # keep short
     candidate_names = [m.name for m in matches[:10]]
+    name_to_category = {m.name: m.category for m in matches[:10]}
     candidates = _format_candidates(matches, max_items=10)
     allowed_keys = ", ".join(CITABLE_KEYS)
 
@@ -240,14 +281,16 @@ def ollama_narrate(
         "   ## 4. Unknowns / tradeoffs\n"
         "   ## Snippets used\n"
         "11) In 'Recommended chain', provide one bullet with matched pedal names in recommended order, separated by ' -> '. If no matches, use '- (none)'.\n"
-        "12) Every chain item MUST be copied exactly from CANDIDATE_NAMES. Do not paraphrase, abbreviate, translate, or replace a pedal name with a description.\n"
-        "13) Each pedal may appear at most once in the chain. Recommending fewer pedals is better than padding with duplicates or weak fits.\n"
-        "14) In 'Why this fits', use 1-2 bullets tied to the requested tone and the selected chain.\n"
-        "15) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
-        "16) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
-        "17) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
-        "18) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
-        "19) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
+        "12) Recommend the smallest coherent set of pedals that satisfies the request. Prefer one best match per role, usually 1-3 pedals total.\n"
+        "13) Every chain item MUST be copied exactly from CANDIDATE_NAMES. Do not paraphrase, abbreviate, translate, or replace a pedal name with a description.\n"
+        "14) Each pedal may appear at most once in the chain. Recommending fewer pedals is better than padding with duplicates or weak fits.\n"
+        "15) Do not use more than one drive, delay, or reverb pedal unless stacking is clearly necessary. If you stack, explicitly justify it in 'Why this fits' using the word 'stack' or 'layer'.\n"
+        "16) In 'Why this fits', use 1-2 bullets that walk through the exact chain from left to right using the exact pedal names in order.\n"
+        "17) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
+        "18) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
+        "19) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
+        "20) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
+        "21) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
     )
 
     template = (
@@ -267,6 +310,7 @@ def ollama_narrate(
         f"MATCH_COUNT: {match_count}\n"
         f"MATCH_IDS: {match_ids}\n\n"
         f"CANDIDATE_NAMES: {candidate_names}\n\n"
+        f"CANDIDATE_NAME_TO_CATEGORY: {name_to_category}\n\n"
         f"Question:\n{question}\n\n"
         f"Candidate matches (already filtered deterministically):\n{candidates}\n\n"
         "Write the final answer following the rules exactly.\n"
@@ -277,7 +321,8 @@ def ollama_narrate(
         "- Unknowns / tradeoffs must briefly say no matching pedals were available.\n"
         "If MATCH_COUNT is >0:\n"
         "- Recommended chain section must recommend an order using matched pedal names only.\n"
-        "- Why this fits must explain how that order supports the requested tone.\n"
+        "- Why this fits must explain that exact chain from left to right using the same pedal names in order.\n"
+        "- Prefer the smallest coherent chain rather than listing every relevant candidate.\n"
         "- Constraints honored must clearly surface explicit requirements that the chain satisfies, such as power, stereo, MIDI, or other parsed constraints, but only when they are supported by provided facts.\n"
         "- Unknowns / tradeoffs must clearly surface missing values, limitations, or compromises instead of hiding them.\n\n"
         f"Template:\n{template}"
@@ -294,7 +339,7 @@ def ollama_narrate(
     )
 
     # Self-heal if it contradicts itself (common with small models)
-    if _looks_inconsistent(out, match_count, candidate_names):
+    if _looks_inconsistent(out, match_count, candidate_names, name_to_category):
         repair = (
             "Your previous answer contradicted MATCH_COUNT or omitted required chain guidance.\n"
             "Regenerate the entire response.\n"
@@ -307,6 +352,9 @@ def ollama_narrate(
             "- Do not paraphrase pedal names into descriptive phrases.\n"
             "- Do not repeat a pedal in the chain.\n"
             "- It is better to recommend fewer pedals than to pad the chain with duplicates.\n"
+            "- Prefer one best pedal per role instead of redundant drive/delay/reverb stacking.\n"
+            "- If you stack pedals from the same core category, explicitly justify that stack in Why this fits using the word 'stack' or 'layer'.\n"
+            "- Why this fits must walk through the exact chain in order using the same pedal names.\n"
             "- Do not include tuner or utility pedals unless the request explicitly calls for them.\n"
             "- Do not omit core requested effect types when matching candidates are available.\n"
             "- Make constraints honored and unknowns / tradeoffs explicit.\n"
