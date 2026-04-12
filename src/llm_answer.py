@@ -250,6 +250,16 @@ def _format_chain_explanation(chain: List[PedalRecord]) -> str:
     )
 
 
+def _human_join(parts: List[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
 def _fallback_constraints_honored(question: str, chain: List[PedalRecord]) -> List[str]:
     ql = question.lower()
     bullets: List[str] = []
@@ -260,15 +270,15 @@ def _fallback_constraints_honored(question: str, chain: List[PedalRecord]) -> Li
     if "9v" in ql:
         known_9v = [p for p in chain if p.power.voltage_v == 9.0]
         if known_9v and len(known_9v) == len(chain):
-            bullets.append("- 9V power is confirmed across the recommended chain where stated (power.voltage_v).")
+            bullets.append("- 9V power is confirmed across the recommended chain where stated.")
         elif known_9v:
-            bullets.append("- 9V power is confirmed for part of the recommended chain (power.voltage_v).")
+            bullets.append("- 9V power is confirmed for part of the recommended chain.")
 
     if "stereo" in ql and any(p.io.stereo_out is True for p in chain):
-        bullets.append("- Stereo output is available in the recommended chain where confirmed (io.stereo_out).")
+        bullets.append("- Stereo output is available where the selected pedals support it.")
 
     if "midi" in ql and any(p.control.midi is True for p in chain):
-        bullets.append("- MIDI support is available in the recommended chain where confirmed (control.midi).")
+        bullets.append("- MIDI support is available where the selected pedals support it.")
 
     if not bullets:
         bullets.append("- Uses exact pedal names from the grounded candidate list and keeps the chain compact.")
@@ -282,8 +292,7 @@ def _fallback_unknowns_or_tradeoffs(chain: List[PedalRecord], total_matches: int
     if not chain:
         return ["- No matching pedals were available."]
 
-    unknown_power_names = [p.name for p in chain if p.power.current_ma is None or p.power.voltage_v is None or p.power.polarity == "unknown"]
-    if unknown_power_names:
+    if any(p.power.current_ma is None or p.power.voltage_v is None or p.power.polarity == "unknown" for p in chain):
         power_unknowns: List[str] = []
         if any(p.power.voltage_v is None for p in chain):
             power_unknowns.append("voltage")
@@ -291,9 +300,9 @@ def _fallback_unknowns_or_tradeoffs(chain: List[PedalRecord], total_matches: int
             power_unknowns.append("current draw")
         if any(p.power.polarity == "unknown" for p in chain):
             power_unknowns.append("polarity")
-        unknown_list = ", ".join(power_unknowns)
+        unknown_list = _human_join(power_unknowns)
         bullets.append(
-            f"- {unknown_list.capitalize()} is still unknown for part of the chain, so power planning remains partial (power.voltage_v) (power.current_ma) (power.polarity)."
+            f"- {unknown_list.capitalize()} is still unknown for part of the chain, so power planning remains partial."
         )
 
     if total_matches > len(chain):
@@ -459,8 +468,8 @@ def ollama_narrate(
         "15) Do not use more than one drive, delay, or reverb pedal unless stacking is clearly necessary. If you stack, explicitly justify it in 'Why this fits' using the duplicated pedal names and the word 'stack' or 'layer'.\n"
         "16) In 'Why this fits', use 1-2 bullets that walk through the exact chain from left to right using the exact pedal names in order. Do not mention candidate pedals that are not in the recommended chain.\n"
         "17) Generic role labels are NOT valid pedal names. Do not output stand-ins like 'Delay', 'Overdrive', 'Spring Reverb', or 'Tape-ish Delay'.\n"
-        "18) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
-        "19) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
+        "18) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. Write natural user-facing prose and do NOT mention dotted field names like power.voltage_v or io.stereo_out.\n"
+        "19) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Write natural user-facing prose, keep the unknowns explicit, and do NOT mention dotted field names in the visible text. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
         "20) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
         "21) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
         "22) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"

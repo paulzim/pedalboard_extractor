@@ -128,6 +128,17 @@ def _is_standalone_citation_key_line(line: str) -> bool:
     ) is not None
 
 
+def _strip_inline_citation_keys(text: str) -> str:
+    cleaned = re.sub(
+        r"\s*\([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\)",
+        "",
+        text,
+    )
+    cleaned = re.sub(r"[ \t]+([.,;:])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
 def clean_grounded_llm_output(text: str) -> str:
     """
     Presentation-friendly cleanup for grounded LLM output.
@@ -139,6 +150,7 @@ def clean_grounded_llm_output(text: str) -> str:
       power.current_ma
       io.stereo_out
       control.expression
+    - inline citation keys like '(power.current_ma)'
     """
     kept_lines: List[str] = []
     for line in text.splitlines():
@@ -151,6 +163,7 @@ def clean_grounded_llm_output(text: str) -> str:
         kept_lines.append(line)
 
     cleaned = "\n".join(kept_lines)
+    cleaned = _strip_inline_citation_keys(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
