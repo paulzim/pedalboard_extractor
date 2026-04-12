@@ -27,7 +27,7 @@ CITABLE_KEYS: List[str] = [
 ]
 
 _CORE_EFFECT_CATEGORIES = {"drive", "delay", "reverb"}
-_PROMPT_DEBUG_MARKER = "GROUND_PROMPT_TRACE_V1"
+_AUXILIARY_CATEGORIES = {"tuner", "utility"}
 
 
 def _short_snip(s: str, limit: int = 140) -> str:
@@ -204,6 +204,143 @@ def _fit_explicitly_justifies_stacking(
     return True
 
 
+def _select_minimal_coherent_chain(matches: List[PedalRecord], limit: int = 3) -> List[PedalRecord]:
+    pool = [m for m in matches if m.category not in _AUXILIARY_CATEGORIES]
+    if not pool:
+        pool = matches
+
+    chosen: List[PedalRecord] = []
+    seen_names: Set[str] = set()
+    seen_core_categories: Set[str] = set()
+
+    for pedal in pool:
+        if pedal.name in seen_names:
+            continue
+        if pedal.category in _CORE_EFFECT_CATEGORIES and pedal.category in seen_core_categories:
+            continue
+        chosen.append(pedal)
+        seen_names.add(pedal.name)
+        if pedal.category in _CORE_EFFECT_CATEGORIES:
+            seen_core_categories.add(pedal.category)
+        if len(chosen) >= limit:
+            break
+
+    if not chosen and pool:
+        chosen.append(pool[0])
+
+    return chosen[:limit]
+
+
+def _format_chain_explanation(chain: List[PedalRecord]) -> str:
+    if not chain:
+        return "- No grounded chain could be recommended from the available matches."
+
+    role_labels = [p.category.replace("_", " ") for p in chain]
+    if len(chain) == 1:
+        return f"- {chain[0].name} is the strongest available grounded match, so the recommendation stays focused on a single {role_labels[0]} stage."
+    if len(chain) == 2:
+        return (
+            f"- {chain[0].name} comes first as the {role_labels[0]} stage, and {chain[1].name} follows as the "
+            f"{role_labels[1]} stage. This keeps the chain compact instead of padding it with weaker extras."
+        )
+    return (
+        f"- {chain[0].name} comes first as the {role_labels[0]} stage, {chain[1].name} follows as the "
+        f"{role_labels[1]} stage, and {chain[2].name} finishes the chain as the {role_labels[2]} stage.\n"
+        "- This keeps one clear pedal per role instead of padding the chain with a second drive, delay, or reverb without strong support from the structured facts."
+    )
+
+
+def _fallback_constraints_honored(question: str, chain: List[PedalRecord]) -> List[str]:
+    ql = question.lower()
+    bullets: List[str] = []
+
+    if not chain:
+        return ["- None could be confirmed because there were no matching pedals."]
+
+    if "9v" in ql:
+        known_9v = [p for p in chain if p.power.voltage_v == 9.0]
+        if known_9v and len(known_9v) == len(chain):
+            bullets.append("- 9V power is confirmed across the recommended chain where stated (power.voltage_v).")
+        elif known_9v:
+            bullets.append("- 9V power is confirmed for part of the recommended chain (power.voltage_v).")
+
+    if "stereo" in ql and any(p.io.stereo_out is True for p in chain):
+        bullets.append("- Stereo output is available in the recommended chain where confirmed (io.stereo_out).")
+
+    if "midi" in ql and any(p.control.midi is True for p in chain):
+        bullets.append("- MIDI support is available in the recommended chain where confirmed (control.midi).")
+
+    if not bullets:
+        bullets.append("- Uses exact pedal names from the grounded candidate list and keeps the chain compact.")
+
+    return bullets[:4]
+
+
+def _fallback_unknowns_or_tradeoffs(chain: List[PedalRecord], total_matches: int) -> List[str]:
+    bullets: List[str] = []
+
+    if not chain:
+        return ["- No matching pedals were available."]
+
+    unknown_power_names = [p.name for p in chain if p.power.current_ma is None or p.power.voltage_v is None or p.power.polarity == "unknown"]
+    if unknown_power_names:
+        power_unknowns: List[str] = []
+        if any(p.power.voltage_v is None for p in chain):
+            power_unknowns.append("voltage")
+        if any(p.power.current_ma is None for p in chain):
+            power_unknowns.append("current draw")
+        if any(p.power.polarity == "unknown" for p in chain):
+            power_unknowns.append("polarity")
+        unknown_list = ", ".join(power_unknowns)
+        bullets.append(
+            f"- {unknown_list.capitalize()} is still unknown for part of the chain, so power planning remains partial (power.voltage_v) (power.current_ma) (power.polarity)."
+        )
+
+    if total_matches > len(chain):
+        bullets.append("- Extra matches were left out because the structured facts did not clearly justify stacking the same role twice.")
+
+    if not bullets:
+        bullets.append("- none")
+
+    return bullets[:3]
+
+
+def _build_grounded_fallback(question: str, matches: List[PedalRecord]) -> str:
+    chain = _select_minimal_coherent_chain(matches)
+    chain_names = " -> ".join(p.name for p in chain) if chain else "(none)"
+
+    lines: List[str] = [
+        "## 1. Recommended chain",
+        f"- {chain_names}",
+        "",
+        "## 2. Why this fits",
+        _format_chain_explanation(chain),
+        "",
+        "## 3. Constraints honored",
+    ]
+    lines.extend(_fallback_constraints_honored(question, chain))
+    lines.extend(
+        [
+            "",
+            "## 4. Unknowns / tradeoffs",
+        ]
+    )
+    lines.extend(_fallback_unknowns_or_tradeoffs(chain, len(matches)))
+
+    body = "\n".join(lines)
+    used_keys = sorted(_extract_used_keys(body))
+    snippet_lines = used_keys if used_keys else ["none"]
+
+    lines.extend(
+        [
+            "",
+            "## Snippets used",
+            *[f"- {key}" for key in snippet_lines],
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _looks_inconsistent(
     text: str,
     match_count: int,
@@ -254,16 +391,9 @@ def _looks_inconsistent(
         re.search(r"^\s*-\s+(?!\(none\)\s*$).+", fit_text, re.MULTILINE | re.IGNORECASE)
     )
     has_constraints_bullet = bool(re.search(r"^\s*-\s+", constraints_text, re.MULTILINE))
-    has_debug_marker = bool(
-        re.search(
-            rf"^\s*-\s+Debug marker:\s*{re.escape(_PROMPT_DEBUG_MARKER)}\s*$",
-            constraints_text,
-            re.MULTILINE | re.IGNORECASE,
-        )
-    )
     has_unknowns_bullet = bool(re.search(r"^\s*-\s+", unknowns_text, re.MULTILINE))
 
-    if not has_recommended_bullet or not has_constraints_bullet or not has_debug_marker or not has_unknowns_bullet:
+    if not has_recommended_bullet or not has_constraints_bullet or not has_unknowns_bullet:
         return True
     if match_count == 0 and has_non_none_chain:
         return True
@@ -328,8 +458,8 @@ def ollama_narrate(
         "14) Each pedal may appear at most once in the chain. Recommending fewer pedals is better than padding with duplicates or weak fits.\n"
         "15) Do not use more than one drive, delay, or reverb pedal unless stacking is clearly necessary. If you stack, explicitly justify it in 'Why this fits' using the duplicated pedal names and the word 'stack' or 'layer'.\n"
         "16) In 'Why this fits', use 1-2 bullets that walk through the exact chain from left to right using the exact pedal names in order. Do not mention candidate pedals that are not in the recommended chain.\n"
-        f"17) The first bullet in 'Constraints honored' MUST be exactly: '- Debug marker: {_PROMPT_DEBUG_MARKER}'\n"
-        "18) After the debug marker, 'Constraints honored' may use 0-3 additional bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
+        "17) Generic role labels are NOT valid pedal names. Do not output stand-ins like 'Delay', 'Overdrive', 'Spring Reverb', or 'Tape-ish Delay'.\n"
+        "18) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
         "19) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
         "20) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
         "21) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
@@ -342,7 +472,6 @@ def ollama_narrate(
         "## 2. Why this fits\n"
         "- <brief explanation tied to the requested tone and provided facts>\n\n"
         "## 3. Constraints honored\n"
-        f"- Debug marker: {_PROMPT_DEBUG_MARKER}\n"
         "- <explicit requirement or capability supported by provided facts; cite any specs mentioned>\n\n"
         "## 4. Unknowns / tradeoffs\n"
         "- <missing value, limitation, or tradeoff; cite any specs mentioned>\n\n"
@@ -361,15 +490,14 @@ def ollama_narrate(
         "If MATCH_COUNT is 0:\n"
         "- Recommended chain section must contain exactly one bullet: '- (none)'.\n"
         "- Why this fits must say no chain can be recommended because MATCH_COUNT is 0.\n"
-        f"- Constraints honored must include the exact debug marker bullet '- Debug marker: {_PROMPT_DEBUG_MARKER}'.\n"
-        "- Constraints honored may then say none could be confirmed because there were no matching pedals.\n"
+        "- Constraints honored may say none could be confirmed because there were no matching pedals.\n"
         "- Unknowns / tradeoffs must briefly say no matching pedals were available.\n"
         "If MATCH_COUNT is >0:\n"
         "- Recommended chain section must recommend an order using matched pedal names only.\n"
         "- Why this fits must explain that exact chain from left to right using the same pedal names in order.\n"
         "- Prefer the smallest coherent chain rather than listing every relevant candidate.\n"
-        f"- Constraints honored must include the exact debug marker bullet '- Debug marker: {_PROMPT_DEBUG_MARKER}'.\n"
-        "- Constraints honored must then clearly surface explicit requirements that the chain satisfies, such as power, stereo, MIDI, or other parsed constraints, but only when they are supported by provided facts.\n"
+        "- Do not use generic role labels as chain entries.\n"
+        "- Constraints honored must clearly surface explicit requirements that the chain satisfies, such as power, stereo, MIDI, or other parsed constraints, but only when they are supported by provided facts.\n"
         "- Unknowns / tradeoffs must clearly surface missing values, limitations, or compromises instead of hiding them.\n\n"
         f"Template:\n{template}"
     )
@@ -393,10 +521,10 @@ def ollama_narrate(
             f"- MATCH_COUNT is {match_count}; your chain guidance MUST match it.\n"
             "- Do not say 'no matches' if MATCH_COUNT > 0.\n"
             "- Include exactly these visible sections: Recommended chain, Why this fits, Constraints honored, Unknowns / tradeoffs.\n"
-            f"- Include this exact visible bullet in Constraints honored: '- Debug marker: {_PROMPT_DEBUG_MARKER}'.\n"
             "- Use matched pedal names only in the recommended chain.\n"
             "- Every chain item must be copied exactly from CANDIDATE_NAMES.\n"
             "- Do not paraphrase pedal names into descriptive phrases.\n"
+            "- Do not use generic role labels like 'Delay', 'Overdrive', 'Spring Reverb', or 'Tape-ish Delay'.\n"
             "- Do not repeat a pedal in the chain.\n"
             "- It is better to recommend fewer pedals than to pad the chain with duplicates.\n"
             "- Prefer one best pedal per role instead of redundant drive/delay/reverb stacking.\n"
@@ -417,6 +545,8 @@ def ollama_narrate(
             timeout_s=timeout_s,
             temperature=0.0,
         )
+        if _looks_inconsistent(out, match_count, candidate_names, name_to_category):
+            out = _build_grounded_fallback(question, matches)
 
     # Optional: you can also enforce Snippets used == cited keys,
     # but for now we just nudge it and keep output readable.

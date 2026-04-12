@@ -133,6 +133,7 @@ def clean_grounded_llm_output(text: str) -> str:
     Presentation-friendly cleanup for grounded LLM output.
 
     Removes:
+    - temporary debug-marker lines
     - trailing 'Snippets used' section, even if the model varies markdown
     - standalone citation-key / dotted field-path lines like:
       power.current_ma
@@ -143,6 +144,8 @@ def clean_grounded_llm_output(text: str) -> str:
     for line in text.splitlines():
         if _is_snippets_used_heading(line):
             break
+        if re.match(r"^\s*(?:-\s*)?Debug marker:\s*", line, re.IGNORECASE):
+            continue
         if _is_standalone_citation_key_line(line):
             continue
         kept_lines.append(line)
