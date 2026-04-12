@@ -113,7 +113,37 @@ def _extract_used_keys(text: str) -> Set[str]:
     return keys
 
 
-def _looks_inconsistent(text: str, match_count: int) -> bool:
+def _extract_recommended_chain_items(text: str) -> List[str]:
+    recommended_section = re.search(
+        r"##\s*(?:1\.\s*)?recommended chain([\s\S]*?)(##\s*(?:2\.\s*)?why this fits|##\s*(?:3\.\s*)?constraints honored|##\s*(?:4\.\s*)?unknowns\s*/\s*tradeoffs|##\s*(?:\d+[.)]\s*)?snippets|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not recommended_section:
+        return []
+
+    bullet = re.search(r"^\s*-\s+(.+)$", recommended_section.group(1), re.MULTILINE)
+    if not bullet:
+        return []
+
+    chain_text = bullet.group(1).strip()
+    if re.fullmatch(r"\(none\)", chain_text, re.IGNORECASE):
+        return []
+
+    parts = re.split(r"\s*(?:->|→|=>|➡|⟶)\s*", chain_text)
+    items: List[str] = []
+    for part in parts:
+        item = part.strip()
+        item = item.strip("`").strip()
+        item = item.strip("*_ ").strip()
+        item = item.strip("\"'“”‘’").strip()
+        item = item.rstrip(".,;:").strip()
+        if item:
+            items.append(item)
+    return items
+
+
+def _looks_inconsistent(text: str, match_count: int, candidate_names: List[str]) -> bool:
     """
     Heuristic: catch obvious format misses so small local models get one
     retry with stricter instructions.
@@ -149,6 +179,7 @@ def _looks_inconsistent(text: str, match_count: int) -> bool:
     fit_text = fit_section.group(1)
     constraints_text = constraints_section.group(1)
     unknowns_text = unknowns_section.group(1)
+    chain_items = _extract_recommended_chain_items(text)
     has_recommended_bullet = bool(re.search(r"^\s*-\s+", recommended_text, re.MULTILINE))
     has_non_none_chain = bool(
         re.search(r"^\s*-\s+(?!\(none\)\s*$).+", recommended_text, re.MULTILINE | re.IGNORECASE)
@@ -166,6 +197,12 @@ def _looks_inconsistent(text: str, match_count: int) -> bool:
     if match_count > 0:
         if not has_non_none_chain or not has_fit_bullet:
             return True
+        if not chain_items:
+            return True
+        if any(item not in set(candidate_names) for item in chain_items):
+            return True
+        if len(set(chain_items)) != len(chain_items):
+            return True
     return False
 
 
@@ -179,6 +216,7 @@ def ollama_narrate(
 ) -> str:
     match_count = len(matches)
     match_ids = [m.id for m in matches[:10]]  # keep short
+    candidate_names = [m.name for m in matches[:10]]
     candidates = _format_candidates(matches, max_items=10)
     allowed_keys = ", ".join(CITABLE_KEYS)
 
@@ -202,12 +240,14 @@ def ollama_narrate(
         "   ## 4. Unknowns / tradeoffs\n"
         "   ## Snippets used\n"
         "11) In 'Recommended chain', provide one bullet with matched pedal names in recommended order, separated by ' -> '. If no matches, use '- (none)'.\n"
-        "12) In 'Why this fits', use 1-2 bullets tied to the requested tone and the selected chain.\n"
-        "13) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
-        "14) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
-        "15) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
-        "16) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
-        "17) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
+        "12) Every chain item MUST be copied exactly from CANDIDATE_NAMES. Do not paraphrase, abbreviate, translate, or replace a pedal name with a description.\n"
+        "13) Each pedal may appear at most once in the chain. Recommending fewer pedals is better than padding with duplicates or weak fits.\n"
+        "14) In 'Why this fits', use 1-2 bullets tied to the requested tone and the selected chain.\n"
+        "15) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
+        "16) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
+        "17) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
+        "18) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
+        "19) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
     )
 
     template = (
@@ -226,6 +266,7 @@ def ollama_narrate(
     user = (
         f"MATCH_COUNT: {match_count}\n"
         f"MATCH_IDS: {match_ids}\n\n"
+        f"CANDIDATE_NAMES: {candidate_names}\n\n"
         f"Question:\n{question}\n\n"
         f"Candidate matches (already filtered deterministically):\n{candidates}\n\n"
         "Write the final answer following the rules exactly.\n"
@@ -253,7 +294,7 @@ def ollama_narrate(
     )
 
     # Self-heal if it contradicts itself (common with small models)
-    if _looks_inconsistent(out, match_count):
+    if _looks_inconsistent(out, match_count, candidate_names):
         repair = (
             "Your previous answer contradicted MATCH_COUNT or omitted required chain guidance.\n"
             "Regenerate the entire response.\n"
@@ -262,6 +303,10 @@ def ollama_narrate(
             "- Do not say 'no matches' if MATCH_COUNT > 0.\n"
             "- Include exactly these visible sections: Recommended chain, Why this fits, Constraints honored, Unknowns / tradeoffs.\n"
             "- Use matched pedal names only in the recommended chain.\n"
+            "- Every chain item must be copied exactly from CANDIDATE_NAMES.\n"
+            "- Do not paraphrase pedal names into descriptive phrases.\n"
+            "- Do not repeat a pedal in the chain.\n"
+            "- It is better to recommend fewer pedals than to pad the chain with duplicates.\n"
             "- Do not include tuner or utility pedals unless the request explicitly calls for them.\n"
             "- Do not omit core requested effect types when matching candidates are available.\n"
             "- Make constraints honored and unknowns / tradeoffs explicit.\n"
