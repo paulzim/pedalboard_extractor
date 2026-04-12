@@ -9,6 +9,62 @@ from src.schema import PedalRecord
 from src.llm_answer import ollama_narrate
 
 
+def infer_requested_categories(q: str) -> List[str]:
+    ql = q.lower()
+    cats: List[str] = []
+
+    def add(cat: str) -> None:
+        if cat not in cats:
+            cats.append(cat)
+
+    # signal-chain-friendly order for tone requests
+    if (
+        ("drive" in ql)
+        or ("distort" in ql)
+        or ("distortion" in ql)
+        or ("gain" in ql)
+        or ("fuzz" in ql)
+        or ("overdrive" in ql)
+    ):
+        add("drive")
+
+    if (
+        ("modulation" in ql)
+        or ("chorus" in ql)
+        or ("phaser" in ql)
+        or ("flanger" in ql)
+        or ("tremolo" in ql)
+    ):
+        add("modulation")
+
+    if ("delay" in ql) or ("echo" in ql) or ("repeats" in ql):
+        add("delay")
+
+    if ("reverb" in ql) or ("washy" in ql) or ("wash" in ql) or ("ambient" in ql) or ("shimmer" in ql):
+        add("reverb")
+
+    if "multi" in ql and ("fx" in ql or "effects" in ql):
+        add("multi_fx")
+
+    if ("looper" in ql) or ("loop" in ql):
+        add("looper")
+
+    if "tuner" in ql:
+        add("tuner")
+
+    if (
+        "utility" in ql
+        or "splitter" in ql
+        or "split " in ql
+        or ql.endswith(" split")
+        or re.search(r"\bdi\b", ql)
+        or "buffer" in ql
+    ):
+        add("utility")
+
+    return cats
+
+
 def load_records(path: str) -> List[PedalRecord]:
     out: List[PedalRecord] = []
     with open(path, "r", encoding="utf-8") as f:
@@ -68,49 +124,12 @@ def parse_question(q: str) -> dict:
     c: dict = {}
 
     # category hints (improved: avoid forcing a single category when the prompt implies multiple effects)
-    cats = set()
-
-    # reverb-ish
-    if ("reverb" in ql) or ("washy" in ql) or ("wash" in ql) or ("ambient" in ql) or ("shimmer" in ql):
-        cats.add("reverb")
-
-    # delay-ish
-    if ("delay" in ql) or ("echo" in ql) or ("repeats" in ql):
-        cats.add("delay")
-
-    # drive-ish
-    if (
-        ("drive" in ql)
-        or ("distort" in ql)
-        or ("distortion" in ql)
-        or ("gain" in ql)
-        or ("fuzz" in ql)
-        or ("overdrive" in ql)
-    ):
-        cats.add("drive")
-
-    # other categories
-    if "tuner" in ql:
-        cats.add("tuner")
-    if ("looper" in ql) or ("loop" in ql):
-        cats.add("looper")
-    if (
-        ("modulation" in ql)
-        or ("chorus" in ql)
-        or ("phaser" in ql)
-        or ("flanger" in ql)
-        or ("tremolo" in ql)
-    ):
-        cats.add("modulation")
-
-    # multi-fx hint
-    if "multi" in ql and ("fx" in ql or "effects" in ql):
-        cats.add("multi_fx")
+    cats = infer_requested_categories(q)
 
     # Only set category if it is unambiguous (exactly one category).
     # If user implies multiple (e.g., drive + delay + reverb), do NOT hard constrain.
     if len(cats) == 1:
-        c["category"] = next(iter(cats))
+        c["category"] = cats[0]
 
     # booleans
     if "midi" in ql:

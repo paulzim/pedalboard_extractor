@@ -10,7 +10,13 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 
 from src.llm_answer import ollama_narrate
-from src.query_demo import apply_constraints, evaluate_constraints, load_records, parse_question
+from src.query_demo import (
+    apply_constraints,
+    evaluate_constraints,
+    infer_requested_categories,
+    load_records,
+    parse_question,
+)
 from src.schema import PedalRecord
 
 st.set_page_config(page_title="Pedalboard Extractor Demo", layout="wide")
@@ -408,6 +414,8 @@ _SPEC_STOPWORDS = {
     "tuner", "utility", "modulation", "multi", "fx", "effects",
 }
 
+_AUXILIARY_CATEGORIES = {"tuner", "utility"}
+
 def split_merge_query(merged: str) -> Tuple[str, dict]:
     merged = merged.strip()
     parsed = parse_question(merged)
@@ -437,6 +445,40 @@ def split_merge_query(merged: str) -> Tuple[str, dict]:
         sound_query = merged
 
     return sound_query, parsed
+
+
+def curate_candidate_matches(ranked: List[PedalRecord], prompt: str, k: int) -> List[PedalRecord]:
+    requested_categories = infer_requested_categories(prompt)
+    requested_core = [cat for cat in requested_categories if cat not in _AUXILIARY_CATEGORIES]
+    explicit_aux_requested = any(cat in _AUXILIARY_CATEGORIES for cat in requested_categories)
+
+    primary_pool = ranked
+    if not explicit_aux_requested:
+        non_aux = [r for r in ranked if r.category not in _AUXILIARY_CATEGORIES]
+        if non_aux:
+            primary_pool = non_aux
+
+    focused_pool = primary_pool
+    if requested_core:
+        requested_matches = [r for r in primary_pool if r.category in requested_core]
+        if requested_matches:
+            focused_pool = requested_matches
+
+    chosen: List[PedalRecord] = []
+
+    for cat in requested_core:
+        match = next((r for r in focused_pool if r.category == cat and r not in chosen), None)
+        if match:
+            chosen.append(match)
+
+    for pool in (focused_pool, primary_pool, ranked):
+        for r in pool:
+            if r not in chosen:
+                chosen.append(r)
+            if len(chosen) >= k:
+                return chosen[:k]
+
+    return chosen[:k]
 
 
 def pick_fallback_pedals(records: List[PedalRecord], prompt: str, k: int) -> List[PedalRecord]:
@@ -496,17 +538,17 @@ def auto_select_pedals(
             ids=ids,
             embs=embs,
             model_name=embed_model,
-            top_k=max(top_k, 10),
+            top_k=len(ids),
             allowed_ids=allowed_ids,
         )
 
         by_id = {r.id: r for r in records}
-        chosen: List[PedalRecord] = []
+        ranked: List[PedalRecord] = []
         for pid, _score in scored:
-            if pid in by_id and by_id[pid] not in chosen:
-                chosen.append(by_id[pid])
-            if len(chosen) >= top_k:
-                break
+            if pid in by_id and by_id[pid] not in ranked:
+                ranked.append(by_id[pid])
+
+        chosen = curate_candidate_matches(ranked, user_prompt, top_k)
 
         if not chosen:
             chosen = pick_fallback_pedals(
@@ -521,7 +563,7 @@ def auto_select_pedals(
         user_prompt,
         top_k,
     )
-    return chosen, constraints, sound_query, []
+    return curate_candidate_matches(chosen, user_prompt, top_k), constraints, sound_query, []
 
 
 # ---------------------------
