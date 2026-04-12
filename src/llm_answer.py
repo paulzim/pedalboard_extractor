@@ -156,22 +156,51 @@ def _names_appear_in_order(text: str, names: List[str]) -> bool:
     return True
 
 
-def _duplicate_core_categories(chain_items: List[str], name_to_category: Dict[str, str]) -> Set[str]:
-    counts: Dict[str, int] = {}
+def _mentioned_candidate_names(text: str, candidate_names: List[str]) -> List[str]:
+    lower = text.lower()
+    return [name for name in candidate_names if name.lower() in lower]
+
+
+def _duplicate_core_category_items(chain_items: List[str], name_to_category: Dict[str, str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
     for item in chain_items:
         category = name_to_category.get(item)
         if category in _CORE_EFFECT_CATEGORIES:
-            counts[category] = counts.get(category, 0) + 1
-    return {category for category, count in counts.items() if count > 1}
+            grouped.setdefault(category, []).append(item)
+    return {category: items for category, items in grouped.items() if len(items) > 1}
 
 
-def _fit_explicitly_justifies_stacking(fit_text: str, duplicate_categories: Set[str]) -> bool:
+def _fit_mentions_only_chain_names(fit_text: str, chain_items: List[str], candidate_names: List[str]) -> bool:
+    mentioned = _mentioned_candidate_names(fit_text, candidate_names)
+    chain_name_set = {name.lower() for name in chain_items}
+    return all(name.lower() in chain_name_set for name in mentioned)
+
+
+def _fit_explicitly_justifies_stacking(
+    fit_text: str,
+    duplicate_items_by_category: Dict[str, List[str]],
+) -> bool:
     lower = fit_text.lower()
-    if not duplicate_categories:
+    if not duplicate_items_by_category:
         return True
-    if not any(word in lower for word in ("stack", "stacking", "layer", "layering")):
-        return False
-    return any(category in lower for category in duplicate_categories)
+    for category, items in duplicate_items_by_category.items():
+        if category not in lower:
+            return False
+        justified = False
+        for idx, left in enumerate(items):
+            for right in items[idx + 1 :]:
+                pair_pattern = re.compile(
+                    rf"(?:{re.escape(left.lower())}[\s\S]{{0,120}}(?:stack|stacking|layer|layering)[\s\S]{{0,120}}{re.escape(right.lower())})"
+                    rf"|(?:{re.escape(right.lower())}[\s\S]{{0,120}}(?:stack|stacking|layer|layering)[\s\S]{{0,120}}{re.escape(left.lower())})"
+                )
+                if pair_pattern.search(lower):
+                    justified = True
+                    break
+            if justified:
+                break
+        if not justified:
+            return False
+    return True
 
 
 def _looks_inconsistent(
@@ -241,7 +270,12 @@ def _looks_inconsistent(
             return True
         if not _names_appear_in_order(fit_text, chain_items):
             return True
-        if not _fit_explicitly_justifies_stacking(fit_text, _duplicate_core_categories(chain_items, name_to_category)):
+        if not _fit_mentions_only_chain_names(fit_text, chain_items, candidate_names):
+            return True
+        if not _fit_explicitly_justifies_stacking(
+            fit_text,
+            _duplicate_core_category_items(chain_items, name_to_category),
+        ):
             return True
     return False
 
@@ -284,8 +318,8 @@ def ollama_narrate(
         "12) Recommend the smallest coherent set of pedals that satisfies the request. Prefer one best match per role, usually 1-3 pedals total.\n"
         "13) Every chain item MUST be copied exactly from CANDIDATE_NAMES. Do not paraphrase, abbreviate, translate, or replace a pedal name with a description.\n"
         "14) Each pedal may appear at most once in the chain. Recommending fewer pedals is better than padding with duplicates or weak fits.\n"
-        "15) Do not use more than one drive, delay, or reverb pedal unless stacking is clearly necessary. If you stack, explicitly justify it in 'Why this fits' using the word 'stack' or 'layer'.\n"
-        "16) In 'Why this fits', use 1-2 bullets that walk through the exact chain from left to right using the exact pedal names in order.\n"
+        "15) Do not use more than one drive, delay, or reverb pedal unless stacking is clearly necessary. If you stack, explicitly justify it in 'Why this fits' using the duplicated pedal names and the word 'stack' or 'layer'.\n"
+        "16) In 'Why this fits', use 1-2 bullets that walk through the exact chain from left to right using the exact pedal names in order. Do not mention candidate pedals that are not in the recommended chain.\n"
         "17) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
         "18) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
         "19) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
@@ -353,8 +387,9 @@ def ollama_narrate(
             "- Do not repeat a pedal in the chain.\n"
             "- It is better to recommend fewer pedals than to pad the chain with duplicates.\n"
             "- Prefer one best pedal per role instead of redundant drive/delay/reverb stacking.\n"
-            "- If you stack pedals from the same core category, explicitly justify that stack in Why this fits using the word 'stack' or 'layer'.\n"
+            "- If you stack pedals from the same core category, explicitly justify that stack in Why this fits using the exact duplicated pedal names and the word 'stack' or 'layer'.\n"
             "- Why this fits must walk through the exact chain in order using the same pedal names.\n"
+            "- Do not mention candidate pedals in Why this fits unless they are in the recommended chain.\n"
             "- Do not include tuner or utility pedals unless the request explicitly calls for them.\n"
             "- Do not omit core requested effect types when matching candidates are available.\n"
             "- Make constraints honored and unknowns / tradeoffs explicit.\n"
