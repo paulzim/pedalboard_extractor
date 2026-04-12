@@ -27,6 +27,7 @@ CITABLE_KEYS: List[str] = [
 ]
 
 _CORE_EFFECT_CATEGORIES = {"drive", "delay", "reverb"}
+_PROMPT_DEBUG_MARKER = "GROUND_PROMPT_TRACE_V1"
 
 
 def _short_snip(s: str, limit: int = 140) -> str:
@@ -253,9 +254,16 @@ def _looks_inconsistent(
         re.search(r"^\s*-\s+(?!\(none\)\s*$).+", fit_text, re.MULTILINE | re.IGNORECASE)
     )
     has_constraints_bullet = bool(re.search(r"^\s*-\s+", constraints_text, re.MULTILINE))
+    has_debug_marker = bool(
+        re.search(
+            rf"^\s*-\s+Debug marker:\s*{re.escape(_PROMPT_DEBUG_MARKER)}\s*$",
+            constraints_text,
+            re.MULTILINE | re.IGNORECASE,
+        )
+    )
     has_unknowns_bullet = bool(re.search(r"^\s*-\s+", unknowns_text, re.MULTILINE))
 
-    if not has_recommended_bullet or not has_constraints_bullet or not has_unknowns_bullet:
+    if not has_recommended_bullet or not has_constraints_bullet or not has_debug_marker or not has_unknowns_bullet:
         return True
     if match_count == 0 and has_non_none_chain:
         return True
@@ -320,11 +328,12 @@ def ollama_narrate(
         "14) Each pedal may appear at most once in the chain. Recommending fewer pedals is better than padding with duplicates or weak fits.\n"
         "15) Do not use more than one drive, delay, or reverb pedal unless stacking is clearly necessary. If you stack, explicitly justify it in 'Why this fits' using the duplicated pedal names and the word 'stack' or 'layer'.\n"
         "16) In 'Why this fits', use 1-2 bullets that walk through the exact chain from left to right using the exact pedal names in order. Do not mention candidate pedals that are not in the recommended chain.\n"
-        "17) In 'Constraints honored', use 1-4 bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
-        "18) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
-        "19) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
-        "20) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
-        "21) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
+        f"17) The first bullet in 'Constraints honored' MUST be exactly: '- Debug marker: {_PROMPT_DEBUG_MARKER}'\n"
+        "18) After the debug marker, 'Constraints honored' may use 0-3 additional bullets. Mention only requirements or capabilities that are explicitly supported by provided facts. If a requested detail is not confirmed, do NOT put it here.\n"
+        "19) In 'Unknowns / tradeoffs', use 1-3 bullets for missing values, mono/stereo limitations, power uncertainty, or chain compromises. Use '- none' only if there are no meaningful unknowns or tradeoffs.\n"
+        "20) Avoid generic one-bullet-per-pedal summaries unless a pedal-specific limitation is important to the chain.\n"
+        "21) In 'Snippets used', list only keys you actually cited (one per line, with a leading '-').\n"
+        "22) Replace template placeholders with actual matched pedals and facts; never output angle-bracket placeholder text.\n"
     )
 
     template = (
@@ -333,6 +342,7 @@ def ollama_narrate(
         "## 2. Why this fits\n"
         "- <brief explanation tied to the requested tone and provided facts>\n\n"
         "## 3. Constraints honored\n"
+        f"- Debug marker: {_PROMPT_DEBUG_MARKER}\n"
         "- <explicit requirement or capability supported by provided facts; cite any specs mentioned>\n\n"
         "## 4. Unknowns / tradeoffs\n"
         "- <missing value, limitation, or tradeoff; cite any specs mentioned>\n\n"
@@ -351,13 +361,15 @@ def ollama_narrate(
         "If MATCH_COUNT is 0:\n"
         "- Recommended chain section must contain exactly one bullet: '- (none)'.\n"
         "- Why this fits must say no chain can be recommended because MATCH_COUNT is 0.\n"
-        "- Constraints honored must say none could be confirmed because there were no matching pedals.\n"
+        f"- Constraints honored must include the exact debug marker bullet '- Debug marker: {_PROMPT_DEBUG_MARKER}'.\n"
+        "- Constraints honored may then say none could be confirmed because there were no matching pedals.\n"
         "- Unknowns / tradeoffs must briefly say no matching pedals were available.\n"
         "If MATCH_COUNT is >0:\n"
         "- Recommended chain section must recommend an order using matched pedal names only.\n"
         "- Why this fits must explain that exact chain from left to right using the same pedal names in order.\n"
         "- Prefer the smallest coherent chain rather than listing every relevant candidate.\n"
-        "- Constraints honored must clearly surface explicit requirements that the chain satisfies, such as power, stereo, MIDI, or other parsed constraints, but only when they are supported by provided facts.\n"
+        f"- Constraints honored must include the exact debug marker bullet '- Debug marker: {_PROMPT_DEBUG_MARKER}'.\n"
+        "- Constraints honored must then clearly surface explicit requirements that the chain satisfies, such as power, stereo, MIDI, or other parsed constraints, but only when they are supported by provided facts.\n"
         "- Unknowns / tradeoffs must clearly surface missing values, limitations, or compromises instead of hiding them.\n\n"
         f"Template:\n{template}"
     )
@@ -381,6 +393,7 @@ def ollama_narrate(
             f"- MATCH_COUNT is {match_count}; your chain guidance MUST match it.\n"
             "- Do not say 'no matches' if MATCH_COUNT > 0.\n"
             "- Include exactly these visible sections: Recommended chain, Why this fits, Constraints honored, Unknowns / tradeoffs.\n"
+            f"- Include this exact visible bullet in Constraints honored: '- Debug marker: {_PROMPT_DEBUG_MARKER}'.\n"
             "- Use matched pedal names only in the recommended chain.\n"
             "- Every chain item must be copied exactly from CANDIDATE_NAMES.\n"
             "- Do not paraphrase pedal names into descriptive phrases.\n"
